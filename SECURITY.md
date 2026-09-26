@@ -68,12 +68,12 @@ If you discover a security vulnerability, please report it responsibly.
 Preferred reporting method:
 
 - **GitHub Security Advisory** (private, recommended for sensitive issues)
-  https://github.com/muhammad-fiaz/httpx.zig/security/advisories/new
+  https://github.com/samooth/httpx.zig/security/advisories/new
 
 Other supported options:
 
 - Open an issue on the repository
-  https://github.com/muhammad-fiaz/httpx.zig/issues
+  https://github.com/samooth/httpx.zig/issues
 - Create a Pull Request if you have already resolved the issue
   (avoid including sensitive exploit details in the PR description)
 

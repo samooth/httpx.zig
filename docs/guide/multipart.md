@@ -202,7 +202,7 @@ pub fn main() !void {
 ```
 ## Large File Uploads & Windows Compatibility
 
-> **Windows users:** a known limitation of Winsock (issue [#26](https://github.com/muhammad-fiaz/httpx.zig/issues/26)) can
+> **Windows users:** a known limitation of Winsock (issue [#26](https://github.com/samooth/httpx.zig/issues/26)) can
 > cause multipart uploads to hang after a few parts when the combined request body
 > exceeds ~64 KB. The root cause is that a single `winsock.send()` call with a
 > buffer larger than the kernel send buffer (~8–64 KB) triggers `WSAEWOULDBLOCK`,

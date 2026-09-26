@@ -19,7 +19,7 @@ hero:
       link: /api/client
     - theme: alt
       text: View on GitHub
-      link: https://github.com/muhammad-fiaz/httpx.zig
+      link: https://github.com/samooth/httpx.zig
 
 features:
   - title: All HTTP Versions
@@ -82,13 +82,13 @@ Detailed methodology and analysis: [Benchmarks Reference](/reference/benchmarks)
 **Latest Release (v0.2.0)**
 
 ```bash
-zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.2.0.tar.gz
+zig fetch --save https://github.com/samooth/httpx.zig/archive/refs/tags/0.2.0.tar.gz
 ```
 
 **Previous Release (v0.1.8)**
 
 ```bash
-zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.8.tar.gz
+zig fetch --save https://github.com/samooth/httpx.zig/archive/refs/tags/0.1.8.tar.gz
 ```
 
 > [!WARNING]
@@ -99,7 +99,7 @@ zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.
 Use this for the latest in-development version from the `main` branch:
 
 ```bash
-zig fetch --save git+https://github.com/muhammad-fiaz/httpx.zig.git
+zig fetch --save git+https://github.com/samooth/httpx.zig.git
 ```
 
 ### Method 3: Manual `build.zig.zon` Configuration
@@ -107,7 +107,7 @@ zig fetch --save git+https://github.com/muhammad-fiaz/httpx.zig.git
 ```zig
 .dependencies = .{
   .httpx = .{
-    .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.2.0.tar.gz",
+    .url = "https://github.com/samooth/httpx.zig/archive/refs/tags/0.2.0.tar.gz",
     .hash = "...",
   },
 },
@@ -123,7 +123,7 @@ httpx.zig is built with production-readiness as a core goal. It is still a relat
 - For **ZON file format** support, check out **[zon.zig](https://github.com/muhammad-fiaz/zon.zig)**.
 - For **spinners/loading/progress bar** support, check out **[loaders.zig](https://github.com/muhammad-fiaz/loaders.zig)**.
 - For **MCP** support, check out **[mcp.zig](https://github.com/muhammad-fiaz/mcp.zig)**.
-- For **HTTP client/server** support, check out **[httpx.zig](https://github.com/muhammad-fiaz/httpx.zig)**.
+- For **HTTP client/server** support, check out **[httpx.zig](https://github.com/samooth/httpx.zig)**.
 - For **API framework** support, check out **[api.zig](https://github.com/muhammad-fiaz/api.zig)**.
 - For **web framework** support, check out **[zix](https://github.com/muhammad-fiaz/zix)**.
 - For **archive/compression** support, check out **[archive.zig](https://github.com/muhammad-fiaz/archive.zig)**.
@@ -175,7 +175,7 @@ All examples are runnable from the repo root:
 zig build run-all-simple_get
 ```
 
-Runnable examples live in `examples/` (see the [README](https://github.com/muhammad-fiaz/httpx.zig#examples)
+Runnable examples live in `examples/` (see the [README](https://github.com/samooth/httpx.zig#examples)
 for the full list), including:
 
 - `simpleServer.zig`: basic HTTP server

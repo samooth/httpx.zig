@@ -70,11 +70,11 @@ pub fn main() !void {
                 \\<rss version="2.0">
                 \\<channel>
                 \\  <title>httpx.zig Updates</title>
-                \\  <link>https://github.com/muhammad-fiaz/httpx.zig</link>
+                \\  <link>https://github.com/samooth/httpx.zig</link>
                 \\  <description>Latest news about httpx.zig</description>
                 \\  <item>
                 \\    <title>v1.0.0 Released</title>
-                \\    <link>https://github.com/muhammad-fiaz/httpx.zig/releases/tag/v1.0.0</link>
+                \\    <link>https://github.com/samooth/httpx.zig/releases/tag/v1.0.0</link>
                  \\    <description>HTTP stack for Zig</description>
                 \\  </item>
                 \\</channel>

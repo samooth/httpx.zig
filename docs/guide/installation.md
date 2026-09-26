@@ -53,13 +53,13 @@ zig build -Dtarget=aarch64-macos
 **Latest Release (v0.2.0)**
 
 ```bash
-zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.2.0.tar.gz
+zig fetch --save https://github.com/samooth/httpx.zig/archive/refs/tags/0.2.0.tar.gz
 ```
 
 **Previous Release (v0.1.8)**
 
 ```bash
-zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.8.tar.gz
+zig fetch --save https://github.com/samooth/httpx.zig/archive/refs/tags/0.1.8.tar.gz
 ```
 
 > [!WARNING]
@@ -70,7 +70,7 @@ zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.
 Use this for the latest in-development version from the `main` branch:
 
 ```bash
-zig fetch --save git+https://github.com/muhammad-fiaz/httpx.zig.git
+zig fetch --save git+https://github.com/samooth/httpx.zig.git
 ```
 
 ## Method 3: Manual `build.zig.zon` Configuration
@@ -81,7 +81,7 @@ zig fetch --save git+https://github.com/muhammad-fiaz/httpx.zig.git
     .version = "0.2.0",
     .dependencies = .{
         .httpx = .{
-            .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.2.0.tar.gz",
+            .url = "https://github.com/samooth/httpx.zig/archive/refs/tags/0.2.0.tar.gz",
             .hash = "...", // Run `zig fetch --save <url>` to generate the hash.
         },
     },
@@ -96,7 +96,7 @@ zig fetch --save git+https://github.com/muhammad-fiaz/httpx.zig.git
 Clone and build directly:
 
 ```bash
-git clone https://github.com/muhammad-fiaz/httpx.zig.git
+git clone https://github.com/samooth/httpx.zig.git
 cd httpx.zig
 zig build
 ```
