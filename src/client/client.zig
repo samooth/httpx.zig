@@ -2295,7 +2295,7 @@ test "client get over http3 serves loopback over real udp" {
             // The endpoint's conn pointer follows each fresh connection;
             // the previous one is already deinited by its own scope.
             srv.ep.conn = qconn;
-            var drv = quicHs.Driver.initServer(alloc, .{ .certChainPem = certPem, .privateKeyPem = keyPem });
+            var drv = quicHs.Driver.initServer(std.Io.Threaded.global_single_threaded.io(), alloc, .{ .certChainPem = certPem, .privateKeyPem = keyPem });
             defer drv.deinit();
             qconn.tls = .{ .ctx = &drv, .start = quicHs.Driver.clientStart, .onData = quicHs.Driver.onData };
             try quicHs.serveHandshake(&srv.ep, &srv.pump, &drv, deadlineMs);
@@ -2740,7 +2740,7 @@ test "client get over http3 with 0-rtt early data resumes session" {
             var qconn = try quicConn.Connection.init(alloc, .server, .{}, seed);
             defer qconn.deinit();
             srv.ep.conn = qconn;
-            var drv = quicHs.Driver.initServer(alloc, .{
+            var drv = quicHs.Driver.initServer(std.Io.Threaded.global_single_threaded.io(), alloc, .{
                 .certChainPem = certPem,
                 .privateKeyPem = keyPem,
                 .ticketKeys = tkeys,

@@ -1129,9 +1129,25 @@ pub const Server = struct {
         var replayCache = tlsSessionMod.ReplayCache.init(self.allocator, 256);
         defer replayCache.deinit();
 
-        const ticketKeys = if (self.cfg.tls) |t| t.ticketKeys orelse tlsSessionMod.TicketKeys{ .current = [_]u8{0x5A} ** 32 } else tlsSessionMod.TicketKeys{ .current = [_]u8{0x5A} ** 32 };
+        // Prefer the configured keys; otherwise mint a fresh one from OS
+        // entropy so HTTP/3 keeps 0-RTT without falling back to a shared
+        // secret. A hardcoded key here would seal every ticket with a
+        // publicly known value, letting anyone forge one and resume as
+        // any client. If the OS entropy source is unavailable we issue no
+        // tickets, which is what the TCP path does when unconfigured.
+        var generatedKeys: ?tlsSessionMod.TicketKeys = null;
+        const ticketKeys: ?tlsSessionMod.TicketKeys = if (self.cfg.tls) |t|
+            t.ticketKeys
+        else if (tlsSessionMod.TicketKeys.generate(self.io)) |k| blk: {
+            generatedKeys = k;
+            break :blk k;
+        } else |_| null;
+        defer if (generatedKeys != null) {
+            // Wipe the sealing key once this connection is done with it.
+            std.crypto.secureZero(u8, &generatedKeys.?.current);
+        };
 
-        var drv = quicHs.Driver.initServer(self.allocator, .{
+        var drv = quicHs.Driver.initServer(self.io, self.allocator, .{
             .certChainPem = certPem,
             .privateKeyPem = keyPem,
             .ticketKeys = ticketKeys,

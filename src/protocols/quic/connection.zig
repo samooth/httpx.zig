@@ -1779,11 +1779,11 @@ fn runTlsHandshake(
 test "quic carries TLS 1.3 handshake end to end" {
     const a = std.testing.allocator;
 
-    var cliD = TlsHandshakeDriver{ .engine = tlsEngine.Engine.initClient(a, .{}) };
+    var cliD = TlsHandshakeDriver{ .engine = tlsEngine.Engine.initClient(std.Io.Threaded.global_single_threaded.io(), a, .{}) };
     defer cliD.flight.deinit(a);
     defer cliD.incoming.deinit(a);
     defer cliD.peerFlight.deinit(a);
-    var srvD = TlsHandshakeDriver{ .engine = tlsEngine.Engine.initServer(a, .{}) };
+    var srvD = TlsHandshakeDriver{ .engine = tlsEngine.Engine.initServer(std.Io.Threaded.global_single_threaded.io(), a, .{}) };
     defer srvD.flight.deinit(a);
     defer srvD.incoming.deinit(a);
     defer srvD.peerFlight.deinit(a);
@@ -1934,11 +1934,11 @@ test "http3 request over quic loopback reaches handler and returns response" {
     const a = std.testing.allocator;
     H3LoopSink.reset();
 
-    var cliD = TlsHandshakeDriver{ .engine = tlsEngine.Engine.initClient(a, .{}) };
+    var cliD = TlsHandshakeDriver{ .engine = tlsEngine.Engine.initClient(std.Io.Threaded.global_single_threaded.io(), a, .{}) };
     defer cliD.flight.deinit(a);
     defer cliD.incoming.deinit(a);
     defer cliD.peerFlight.deinit(a);
-    var srvD = TlsHandshakeDriver{ .engine = tlsEngine.Engine.initServer(a, .{}) };
+    var srvD = TlsHandshakeDriver{ .engine = tlsEngine.Engine.initServer(std.Io.Threaded.global_single_threaded.io(), a, .{}) };
     defer srvD.flight.deinit(a);
     defer srvD.incoming.deinit(a);
     defer srvD.peerFlight.deinit(a);

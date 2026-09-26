@@ -584,7 +584,7 @@ fn h3DoRequest(
     };
     defer if (capturedSession.ticket.len > 0) capturedSession.deinit(a);
 
-    var driver = quicHs.Driver.initClient(a, .{
+    var driver = quicHs.Driver.initClient(io, a, .{
         .host = host,
         .verify = t.verify,
         .caPem = t.caPem,

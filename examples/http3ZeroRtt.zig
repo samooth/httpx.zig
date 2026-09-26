@@ -70,6 +70,7 @@ const DemoServer = struct {
 
     fn serveOne(
         srv: *DemoServer,
+        io: std.Io,
         alloc: std.mem.Allocator,
         seed: u64,
         tkeys: httpx.tls.session.TicketKeys,
@@ -83,7 +84,7 @@ const DemoServer = struct {
         }
         srv.ep.conn = qconn;
 
-        var drv = httpx.quic.HandshakeDriver.initServer(alloc, .{
+        var drv = httpx.quic.HandshakeDriver.initServer(io, alloc, .{
             .certChainPem = demoCertPem,
             .privateKeyPem = demoKeyPem,
             .ticketKeys = tkeys,
@@ -142,12 +143,12 @@ const DemoServer = struct {
         }
     }
 
-    fn run(srv: *DemoServer, alloc: std.mem.Allocator, out: *?anyerror, tkeys: httpx.tls.session.TicketKeys, rcache: *httpx.tls.session.ReplayCache) void {
-        srv.serveOne(alloc, 0x51, tkeys, rcache) catch |e| {
+    fn run(srv: *DemoServer, io: std.Io, alloc: std.mem.Allocator, out: *?anyerror, tkeys: httpx.tls.session.TicketKeys, rcache: *httpx.tls.session.ReplayCache) void {
+        srv.serveOne(io, alloc, 0x51, tkeys, rcache) catch |e| {
             out.* = e;
             return;
         };
-        srv.serveOne(alloc, 0x52, tkeys, rcache) catch |e| {
+        srv.serveOne(io, alloc, 0x52, tkeys, rcache) catch |e| {
             out.* = e;
             return;
         };
@@ -184,7 +185,7 @@ pub fn main() !void {
     defer srv.pump.stop();
 
     var srvResult: ?anyerror = error.NotRun;
-    const srvThread = try std.Thread.spawn(.{}, DemoServer.run, .{ &srv, allocator, &srvResult, ticketKeys, &replayCache });
+    const srvThread = try std.Thread.spawn(.{}, DemoServer.run, .{ &srv, io, allocator, &srvResult, ticketKeys, &replayCache });
 
     // 3. Client: First Request (Cold Connection, Full Handshake)
     var client = httpx.Client.init(allocator, io, .{});
