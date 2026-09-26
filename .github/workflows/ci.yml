@@ -84,8 +84,13 @@ jobs:
           ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
           ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
 
-      - name: Build (ReleaseFast)
-        run: zig build -Doptimize=ReleaseFast
+      # Runs the suite, not just the build. ReleaseFast is the only mode
+      # that reliably catches stack-lifetime bugs — a slice of a returned
+      # stack frame is harmless in Debug and reads garbage here — so
+      # building alone lets them through. Cross-target builds below stay
+      # build-only, since foreign binaries cannot be executed here.
+      - name: Test (ReleaseFast)
+        run: zig build -Doptimize=ReleaseFast test --summary all --test-timeout 180s
         env:
           ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
           ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
