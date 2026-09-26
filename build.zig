@@ -99,6 +99,33 @@ fn embedDir(b: *std.Build, exe: *std.Build.Step.Compile, httpxModule: *std.Build
 
 /// Build configuration for httpx.zig - Production-ready HTTP library for Zig
 /// Supports HTTP/1.1, HTTP/2, HTTP/3 with TLS, connection pooling, and more.
+/// Third-party import names for src/httpx.zig, paired positionally with
+/// the dependency modules below.
+const dep_names = [_][]const u8{ "zstd", "brotli", "env", "loaders", "treesitter" };
+
+/// Wires the third-party imports httpx.zig expects into `m`.
+fn addHttpxImports(m: *std.Build.Module, deps: []const *std.Build.Module) void {
+    for (dep_names, deps) |name, dep| m.addImport(name, dep);
+}
+
+/// Creates the httpx root module (src/httpx.zig) with its third-party
+/// imports wired in. The tests, the static library and the cross-target
+/// sweep each need this same module, so it is built in one place.
+fn httpxRootModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    deps: []const *std.Build.Module,
+) *std.Build.Module {
+    const m = b.createModule(.{
+        .root_source_file = b.path("src/httpx.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addHttpxImports(m, deps);
+    return m;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
 
@@ -129,17 +156,20 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const deps = [_]*std.Build.Module{
+        zstdDep.module("zstd"),
+        brotliDep.module("brotli"),
+        envDep.module("env"),
+        loadersDep.module("loaders"),
+        treesitterDep.module("treesitter"),
+    };
+
     // Create the public module that will be exported as "httpx" to consumers.
     // Dependencies must be added here so they propagate to downstream packages.
     const httpxModule = b.addModule("httpx", .{
         .root_source_file = b.path("src/httpx.zig"),
     });
-
-    httpxModule.addImport("zstd", zstdDep.module("zstd"));
-    httpxModule.addImport("brotli", brotliDep.module("brotli"));
-    httpxModule.addImport("env", envDep.module("env"));
-    httpxModule.addImport("loaders", loadersDep.module("loaders"));
-    httpxModule.addImport("treesitter", treesitterDep.module("treesitter"));
+    addHttpxImports(httpxModule, &deps);
 
     const examples = [_]struct { name: []const u8, path: []const u8 }{
         .{ .name = "simple-get", .path = "examples/simpleGet.zig" },
@@ -292,17 +322,8 @@ pub fn build(b: *std.Build) void {
     }
 
     const tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/httpx.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+        .root_module = httpxRootModule(b, target, optimize, &deps),
     });
-    tests.root_module.addImport("zstd", zstdDep.module("zstd"));
-    tests.root_module.addImport("brotli", brotliDep.module("brotli"));
-    tests.root_module.addImport("env", envDep.module("env"));
-    tests.root_module.addImport("loaders", loadersDep.module("loaders"));
-    tests.root_module.addImport("treesitter", treesitterDep.module("treesitter"));
     linkPlatformLibs(tests, target);
 
     const runTests = b.addRunArtifact(tests);
@@ -335,16 +356,7 @@ pub fn build(b: *std.Build) void {
     const benchStep = b.step("bench", "Run benchmarks");
     benchStep.dependOn(&runBench.step);
 
-    const librootModule = b.createModule(.{
-        .root_source_file = b.path("src/httpx.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    librootModule.addImport("zstd", zstdDep.module("zstd"));
-    librootModule.addImport("brotli", brotliDep.module("brotli"));
-    librootModule.addImport("env", envDep.module("env"));
-    librootModule.addImport("loaders", loadersDep.module("loaders"));
-    librootModule.addImport("treesitter", treesitterDep.module("treesitter"));
+    const librootModule = httpxRootModule(b, target, optimize, &deps);
 
     const lib = b.addLibrary(.{
         .name = "httpx",
