@@ -3,15 +3,15 @@
 
 <a href="https://muhammad-fiaz.github.io/httpx.zig/"><img src="https://img.shields.io/badge/docs-muhammad--fiaz.github.io-blue" alt="Documentation"></a>
 <a href="https://ziglang.org/"><img src="https://img.shields.io/badge/Zig-0.16.0-orange.svg?logo=zig" alt="Zig Version"></a>
-<a href="https://github.com/samooth/httpx.zig"><img src="https://img.shields.io/github/stars/muhammad-fiaz/httpx.zig" alt="GitHub stars"></a>
-<a href="https://github.com/samooth/httpx.zig/issues"><img src="https://img.shields.io/github/issues/muhammad-fiaz/httpx.zig" alt="GitHub issues"></a>
-<a href="https://github.com/samooth/httpx.zig/pulls"><img src="https://img.shields.io/github/issues-pr/muhammad-fiaz/httpx.zig" alt="GitHub pull requests"></a>
-<a href="https://github.com/samooth/httpx.zig"><img src="https://img.shields.io/github/last-commit/muhammad-fiaz/httpx.zig" alt="GitHub last commit"></a>
-<a href="https://github.com/samooth/httpx.zig"><img src="https://img.shields.io/github/license/muhammad-fiaz/httpx.zig" alt="License"></a>
+<a href="https://github.com/samooth/httpx.zig"><img src="https://img.shields.io/github/stars/samooth/httpx.zig" alt="GitHub stars"></a>
+<a href="https://github.com/samooth/httpx.zig/issues"><img src="https://img.shields.io/github/issues/samooth/httpx.zig" alt="GitHub issues"></a>
+<a href="https://github.com/samooth/httpx.zig/pulls"><img src="https://img.shields.io/github/issues-pr/samooth/httpx.zig" alt="GitHub pull requests"></a>
+<a href="https://github.com/samooth/httpx.zig"><img src="https://img.shields.io/github/last-commit/samooth/httpx.zig" alt="GitHub last commit"></a>
+<a href="https://github.com/samooth/httpx.zig"><img src="https://img.shields.io/github/license/samooth/httpx.zig" alt="License"></a>
 <a href="https://github.com/samooth/httpx.zig/actions/workflows/ci.yml"><img src="https://github.com/samooth/httpx.zig/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 <img src="https://img.shields.io/badge/platforms-linux%20%7C%20windows%20%7C%20macos-blue" alt="Supported Platforms">
 <a href="https://github.com/samooth/httpx.zig/actions/workflows/github-code-scanning/codeql"><img src="https://github.com/samooth/httpx.zig/actions/workflows/github-code-scanning/codeql/badge.svg" alt="CodeQL"></a>
-<a href="https://github.com/samooth/httpx.zig/releases/latest"><img src="https://img.shields.io/github/v/release/muhammad-fiaz/httpx.zig?label=Latest%20Release&style=flat-square" alt="Latest Release"></a>
+<a href="https://github.com/samooth/httpx.zig/releases/latest"><img src="https://img.shields.io/github/v/release/samooth/httpx.zig?label=Latest%20Release&style=flat-square" alt="Latest Release"></a>
 <a href="https://pay.muhammadfiaz.com"><img src="https://img.shields.io/badge/Sponsor-pay.muhammadfiaz.com-ff69b4?style=flat&logo=heart" alt="Sponsor"></a>
 <a href="https://github.com/sponsors/muhammad-fiaz"><img src="https://img.shields.io/badge/Sponsor-GitHub-pink?style=social&logo=github" alt="GitHub Sponsors"></a>
 <a href="https://hits.sh/muhammad-fiaz/httpx.zig/"><img src="https://hits.sh/muhammad-fiaz/httpx.zig.svg?label=Visitors&extraCount=0&color=green" alt="Repo Visitors"></a>
