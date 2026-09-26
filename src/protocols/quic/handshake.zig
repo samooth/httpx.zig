@@ -702,9 +702,9 @@ test "live handshake over real udp loopback establishes both ends" {
     var ctx = @import("../../sockets/tcp.zig").IoContext.init(a) catch return;
     defer ctx.deinit();
 
-    var cliConn = try connMod.Connection.init(a, .client, .{}, 0x4311);
+    var cliConn = try connMod.Connection.init(a, std.Io.Threaded.global_single_threaded.io(), .client, .{});
     defer cliConn.deinit();
-    var srvConn = try connMod.Connection.init(a, .server, .{}, 0x4312);
+    var srvConn = try connMod.Connection.init(a, std.Io.Threaded.global_single_threaded.io(), .server, .{});
     defer srvConn.deinit();
 
     var cliEp = try transportMod.Endpoint.init(a, ctx.io, cliConn, .{});
@@ -814,7 +814,7 @@ pub fn performHandshake(
 
 test "peer transport parameters apply to connection windows" {
     const a = std.testing.allocator;
-    var conn = try connMod.Connection.init(a, .client, .{}, 0x7771);
+    var conn = try connMod.Connection.init(a, std.Io.Threaded.global_single_threaded.io(), .client, .{});
     defer conn.deinit();
 
     const putCid = struct {
@@ -895,7 +895,7 @@ test "peer transport parameters apply to connection windows" {
 
 test "server closes unknown alpn with no_application_protocol" {
     const a = std.testing.allocator;
-    var srvConn = try connMod.Connection.init(a, .server, .{}, 0x7772);
+    var srvConn = try connMod.Connection.init(a, std.Io.Threaded.global_single_threaded.io(), .server, .{});
     defer srvConn.deinit();
     // Initial keys + validated address so the close packet can fly.
     try srvConn.installInitialKeys();
@@ -943,9 +943,9 @@ test "live QUIC 0-RTT resumption over real udp loopback sends early data and est
     var sessionCaptured = false;
 
     {
-        var cliConn = try connMod.Connection.init(a, .client, .{}, 0x5101);
+        var cliConn = try connMod.Connection.init(a, std.Io.Threaded.global_single_threaded.io(), .client, .{});
         defer cliConn.deinit();
-        var srvConn = try connMod.Connection.init(a, .server, .{}, 0x5102);
+        var srvConn = try connMod.Connection.init(a, std.Io.Threaded.global_single_threaded.io(), .server, .{});
         defer srvConn.deinit();
 
         var cliEp = try transportMod.Endpoint.init(a, ctx.io, cliConn, .{});
@@ -1003,9 +1003,9 @@ test "live QUIC 0-RTT resumption over real udp loopback sends early data and est
 
     // 2. Resumed Connection: Client uses savedSession and sends 0-RTT early data
     {
-        var cliConn = try connMod.Connection.init(a, .client, .{}, 0x5201);
+        var cliConn = try connMod.Connection.init(a, std.Io.Threaded.global_single_threaded.io(), .client, .{});
         defer cliConn.deinit();
-        var srvConn = try connMod.Connection.init(a, .server, .{}, 0x5202);
+        var srvConn = try connMod.Connection.init(a, std.Io.Threaded.global_single_threaded.io(), .server, .{});
         defer srvConn.deinit();
 
         var cliEp = try transportMod.Endpoint.init(a, ctx.io, cliConn, .{});

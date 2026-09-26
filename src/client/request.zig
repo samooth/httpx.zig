@@ -555,7 +555,7 @@ fn h3DoRequest(
     const dest = destAddr.toStd(null);
 
     const t = tlsOpts orelse TlsOptions{ .verify = .caBundle, .allowTruncation = true };
-    var conn = quicConn.Connection.init(a, .client, .{}, @intCast(clockMod.millisNow())) catch return Error.OutOfMemory;
+    var conn = quicConn.Connection.init(a, io, .client, .{}) catch return Error.OutOfMemory;
     defer conn.deinit();
     var ep = quicEp.Endpoint.init(a, io, conn, .{}) catch return Error.ConnectFailed;
     defer ep.deinit();
