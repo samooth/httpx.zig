@@ -72,11 +72,10 @@ const DemoServer = struct {
         srv: *DemoServer,
         io: std.Io,
         alloc: std.mem.Allocator,
-        seed: u64,
         tkeys: httpx.tls.session.TicketKeys,
         rcache: *httpx.tls.session.ReplayCache,
     ) !void {
-        var qconn = try httpx.quic.Connection.init(alloc, .server, .{}, seed);
+        var qconn = try httpx.quic.Connection.init(alloc, io, .server, .{});
         const prevConn = srv.ep.conn;
         defer {
             qconn.deinit();
@@ -144,11 +143,11 @@ const DemoServer = struct {
     }
 
     fn run(srv: *DemoServer, io: std.Io, alloc: std.mem.Allocator, out: *?anyerror, tkeys: httpx.tls.session.TicketKeys, rcache: *httpx.tls.session.ReplayCache) void {
-        srv.serveOne(io, alloc, 0x51, tkeys, rcache) catch |e| {
+        srv.serveOne(io, alloc, tkeys, rcache) catch |e| {
             out.* = e;
             return;
         };
-        srv.serveOne(io, alloc, 0x52, tkeys, rcache) catch |e| {
+        srv.serveOne(io, alloc, tkeys, rcache) catch |e| {
             out.* = e;
             return;
         };
@@ -173,7 +172,7 @@ pub fn main() !void {
     const ticketKeys = httpx.tls.session.TicketKeys{ .current = [_]u8{0x42} ** 32 };
 
     // 2. Start Loopback HTTP/3 Server with 0-RTT and Session Resumption
-    var placeholder = try httpx.quic.Connection.init(allocator, .server, .{}, 0x50);
+    var placeholder = try httpx.quic.Connection.init(allocator, io, .server, .{});
     defer placeholder.deinit();
 
     var srv = DemoServer{};

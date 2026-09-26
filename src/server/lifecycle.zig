@@ -379,7 +379,7 @@ pub const Server = struct {
         var h3Ep_opt: ?quicTransport.Endpoint = null;
         var h3Placeholder_opt: ?*quicConn.Connection = null;
         if (effectiveCfg.http3 and loadedCertPem != null and loadedKeyPem != null) {
-            const placeholder = try quicConn.Connection.init(allocator, .server, .{}, 0x4833);
+            const placeholder = try quicConn.Connection.init(allocator, io, .server, .{});
             errdefer placeholder.deinit();
             const ep = quicTransport.Endpoint.init(allocator, io, placeholder, .{ .port = listener.localPort() }) catch |err| {
                 placeholder.deinit();
@@ -1117,9 +1117,8 @@ pub const Server = struct {
         const certPem = self.tlsCertPemLoaded orelse return error.NoCertificate;
         const keyPem = self.tlsKeyPemLoaded orelse return error.NoPrivateKey;
 
-        const seed: u64 = @as(u64, @intCast(clock.millisNow())) ^ 0x4833;
         const oldConn = ep.conn;
-        const qconn = try quicConn.Connection.init(self.allocator, .server, .{}, seed);
+        const qconn = try quicConn.Connection.init(self.allocator, self.io, .server, .{});
         defer {
             qconn.deinit();
             ep.conn = oldConn;
