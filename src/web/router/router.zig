@@ -911,18 +911,13 @@ pub const Router = struct {
     /// across the match. HEAD falls back to GET when no explicit HEAD route
     /// exists (body stripped by the transport).
     pub fn match(self: *Router, method: Method, path: []const u8, ctx: *Context) ?*const fn (*Context) anyerror!Response {
-        const orig = ctx.method;
-        if (self.matchMethod(method, path, ctx)) |h| return h;
-        if (method == .HEAD) {
-            if (self.matchMethod(.GET, path, ctx)) |h| {
-                ctx.method = orig;
-                return h;
-            }
-        }
-        return null;
+        const entry = self.matchEntryWithFallback(method, path, ctx) orelse return null;
+        return entry.handler;
     }
 
-    fn matchMethod(self: *Router, method: Method, path: []const u8, ctx: *Context) ?*const fn (*Context) anyerror!Response {
+    /// One scan of the route table: returns the highest-priority entry whose
+    /// pattern matches, filling `ctx` with the extracted path params on win.
+    fn matchEntryMethod(self: *Router, method: Method, path: []const u8, ctx: *Context) ?*const RouteEntry {
         const clean = cleanRequestPath(path);
         // Preserve a transport-populated query when the match input is
         // already stripped (server path); otherwise extract from the input.
@@ -972,29 +967,28 @@ pub const Router = struct {
             }
         }
 
-        return if (best) |b| b.handler else null;
+        return best;
+    }
+
+    /// Resolves a request to its winning entry, applying the
+    /// HEAD-falls-back-to-GET rule. `match` and `matchEntry` share this so they
+    /// can never disagree about which route wins.
+    fn matchEntryWithFallback(self: *Router, method: Method, path: []const u8, ctx: *Context) ?*const RouteEntry {
+        const orig = ctx.method;
+        if (self.matchEntryMethod(method, path, ctx)) |entry| return entry;
+        if (method == .HEAD) {
+            if (self.matchEntryMethod(.GET, path, ctx)) |entry| {
+                ctx.method = orig;
+                return entry;
+            }
+        }
+        return null;
     }
 
     /// Rich match: returns the winning route entry (handler + middleware +
     /// metadata) instead of just the handler. Fills `ctx` params like match().
     pub fn matchEntry(self: *Router, method: Method, path: []const u8, ctx: *Context) ?*const RouteEntry {
-        if (self.match(method, path, ctx) == null) return null;
-        const clean = cleanRequestPath(path);
-        var best: ?*const RouteEntry = null;
-        var bestScore: i64 = -1;
-        for (self.routes.items) |*entry| {
-            if (entry.method != method) continue;
-            var probe = ctx.*;
-            probe.paramCount = 0;
-            if (matchPattern(&entry.pattern, clean, &probe)) {
-                const score: i64 = @intCast(entry.priority);
-                if (score > bestScore) {
-                    bestScore = score;
-                    best = entry;
-                }
-            }
-        }
-        return best;
+        return self.matchEntryWithFallback(method, path, ctx);
     }
 
     /// Methods with a route matching `path` (any method), for 405/OPTIONS.
@@ -1449,6 +1443,21 @@ test "transport query field survives match on clean path" {
     try std.testing.expect(h != null);
     try std.testing.expectEqualStrings("zig", ctx.queryParam("q").?);
     try std.testing.expectEqualStrings("2", ctx.queryParam("page").?);
+}
+
+test "matchEntry agrees with match on the HEAD fallback" {
+    const a = std.testing.allocator;
+    var router = Router.init(a);
+    defer router.deinit();
+
+    try router.get("/asset", dummyHandler, .{});
+    var ctx = Context{ .allocator = a, .method = .HEAD };
+
+    // match() resolves HEAD onto the GET handler...
+    try std.testing.expect(router.match(.HEAD, "/asset", &ctx) != null);
+    // ...so matchEntry() must surface that same entry instead of null.
+    const entry = router.matchEntry(.HEAD, "/asset", &ctx);
+    try std.testing.expect(entry != null);
 }
 
 test "HEAD falls back to GET handler" {
