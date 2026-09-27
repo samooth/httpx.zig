@@ -328,6 +328,17 @@ pub fn build(b: *std.Build) void {
 
     const runTests = b.addRunArtifact(tests);
     runTests.has_side_effects = true;
+    const leakMod = b.createModule(.{
+        .root_source_file = b.path("src/leakroot.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addHttpxImports(leakMod, &deps);
+    const leakTests = b.addTest(.{ .root_module = leakMod });
+    linkPlatformLibs(leakTests, target);
+    const runLeak = b.addRunArtifact(leakTests);
+    b.step("leak-probe", "reduced leak probe").dependOn(&runLeak.step);
+
     const testStep = b.step("test", "Run unit tests");
 
     // Only run tests when target matches host; otherwise build test artifact only.
