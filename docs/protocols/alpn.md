@@ -11,6 +11,12 @@ List Length: 2 octets (16-bit vector)
 Protocol Name: 1 octet length prefix + opaque ASCII string
 ```
 
+> **Status:** the `h2` identifier below is advertised by default but the
+> server does not implement HTTP/2, so negotiating it breaks the connection.
+> Clients that offer `h2` — which includes every browser and a default
+> `curl` — need `--http1.1` or an explicit `alpn` setting until this is
+> fixed. See [Interop Status](/reference/interop-status).
+
 ## Supported Identifiers
 
 * `h2`: HTTP/2 over TLS (RFC 7540 / RFC 9113)

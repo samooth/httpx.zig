@@ -1,5 +1,11 @@
 # TLS 1.3 Protocol
 
+> **X25519MLKEM768 is implemented for outgoing handshakes only.** As a client
+> we offer the hybrid group first, so we connect to post-quantum servers. As a
+> server our `key_share` is fixed to `x25519`, so a client that offers only the
+> hybrid — the default for OpenSSL 3.5+ — is rejected. See
+> [Interop Status](/reference/interop-status).
+
 RFC 8446 defines Transport Layer Security Version 1.3, delivering major security and performance improvements over previous TLS versions.
 
 ## Key Improvements in TLS 1.3

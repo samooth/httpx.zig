@@ -75,6 +75,8 @@ Benchmark target: `x86_64-windows`, `ReleaseFast` (measured 2026-09-07).
 
 Detailed methodology and analysis: [Benchmarks Reference](/reference/benchmarks).
 
+What real third-party clients do against httpx, including known gaps: [Interop Status](/reference/interop-status).
+
 ## Installation
 
 ### Method 1: Zig Fetch (Recommended)
