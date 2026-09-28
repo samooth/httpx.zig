@@ -186,6 +186,38 @@ test "interop: openssl s_client completes a TLS 1.3 handshake with us" {
     try std.testing.expect(std.mem.indexOf(u8, out, "Verification: OK") != null);
 }
 
+test "interop: curl over HTTPS with SNI" {
+    if (skipUnlessInterop()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+
+    var h = try Harness.start(a, io, true);
+    defer h.stop(a);
+
+    // --resolve makes curl use the hostname `localhost` (so it sends SNI, as
+    // every real client does) while still dialling our loopback port. Without
+    // it curl would connect to an IP literal and omit SNI entirely, which is
+    // exactly the case that is known to work -- so the test would pass while
+    // hiding the bug.
+    const addr = try std.fmt.allocPrint(a, "localhost:{d}:127.0.0.1", .{h.port});
+    defer a.free(addr);
+    const url = try std.fmt.allocPrint(a, "https://localhost:{d}/ping", .{h.port});
+    defer a.free(url);
+    const out = try runClient(a, io, &.{
+        "curl",       "--silent",
+        "--http1.1",  "--show-error",
+        "--insecure", "--include",
+        "--max-time", "20",
+        "--resolve",  addr,
+        url,
+    }, null);
+    defer a.free(out);
+
+    std.debug.print("\n---CURL-OUT---\n{s}\n---END---\n", .{out});
+    try std.testing.expect(std.mem.indexOf(u8, out, "HTTP/1.1 200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "httpx-interop-ok") != null);
+}
+
 test "interop: OpenSSL negotiates the post-quantum hybrid group" {
     // DISABLED pending a server-side fix.
     //
