@@ -45,22 +45,24 @@ pushed during a render leaked. See the `*Context` guard in `renderer.zig`.
 
 ## Open
 
-### `h2` is advertised but not implemented
+### `h2` advertised through ALPN but not implemented
 
-`Server.Config.alpn` defaults to `alpnMod.DEFAULT_TCP_PREFERENCE`, which
-leads with `h2`. The HTTP layer has an `http2` flag but no HTTP/2
-implementation behind it.
+`Server.Config.alpn` defaulted to `alpnMod.DEFAULT_TCP_PREFERENCE`, which
+leads with `h2`, while the HTTP layer has an `http2` flag with no HTTP/2
+framing behind it. The server therefore negotiated `h2` with any modern
+client and then did not speak it: `curl https://host/ping` failed with
+`curl: (56)` while the same request with `--http1.1` returned
+`HTTP/1.1 200 OK`. Every browser and a default `curl` hit this on HTTPS.
 
-So the server negotiates `h2` with any modern client and then does not
-speak it. Measured: `curl https://host/ping` fails with `curl: (56)`,
-while the same request with `--http1.1` returns `HTTP/1.1 200 OK`. Every
-browser and a default `curl` hit this on HTTPS.
+`Server.init` now derives the ALPN preference from the protocols it can
+actually speak, storing the corrected list on the config so that certificate
+reload — which rebuilds the TLS server from `self.cfg.tls.?.alpn` — does not
+reintroduce the default. A list chosen explicitly is left alone, including a
+deliberate `h2`.
 
-The fix is to have `Server` pass TLS the protocol list it can actually
-serve, tied to its `httpVersion` configuration, rather than changing the
-default preference in place — the current default also leaves
-`Config.http2 = true` asserting something untrue. Until then, use
-`--http1.1` or configure `alpn` explicitly.
+`Config.http2` still exists and still defaults to `true`; it is not wired to
+any framing, so it should not be read as a capability. HTTP/2 remains
+unimplemented — the fix is that we no longer claim it.
 
 ### X25519MLKEM768 is client-side only
 

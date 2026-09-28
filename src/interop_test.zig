@@ -204,12 +204,11 @@ test "interop: curl over HTTPS with SNI" {
     const url = try std.fmt.allocPrint(a, "https://localhost:{d}/ping", .{h.port});
     defer a.free(url);
     const out = try runClient(a, io, &.{
-        "curl",       "--silent",
-        "--http1.1",  "--show-error",
-        "--insecure", "--include",
-        "--max-time", "20",
-        "--resolve",  addr,
-        url,
+        "curl",         "--silent",
+        "--show-error", "--insecure",
+        "--include",    "--max-time",
+        "20",           "--resolve",
+        addr,           url,
     }, null);
     defer a.free(out);
 

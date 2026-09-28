@@ -11,11 +11,13 @@ List Length: 2 octets (16-bit vector)
 Protocol Name: 1 octet length prefix + opaque ASCII string
 ```
 
-> **Status:** the `h2` identifier below is advertised by default but the
-> server does not implement HTTP/2, so negotiating it breaks the connection.
-> Clients that offer `h2` — which includes every browser and a default
-> `curl` — need `--http1.1` or an explicit `alpn` setting until this is
-> fixed. See [Interop Status](/reference/interop-status).
+> **Status:** the server derives its ALPN preference from the protocols it
+> can actually speak, and does not advertise `h2` — HTTP/2 is not
+> implemented, so offering the identifier negotiated a protocol we then
+> failed on. The `h2` entry below lists the identifier as defined by the
+> RFCs, not as something currently served. An explicitly configured `alpn`
+> list is honoured as given. See
+> [Interop Status](/reference/interop-status).
 
 ## Supported Identifiers
 
