@@ -161,10 +161,10 @@ zig build -Dtarget=x86-windows
 
 ### Method 1: Zig Fetch (Recommended)
 
-**Latest Release (v0.2.0)**
+**Latest Release (v0.2.3)**
 
 ```bash
-zig fetch --save https://github.com/samooth/httpx.zig/archive/refs/tags/0.2.0.tar.gz
+zig fetch --save https://github.com/samooth/httpx.zig/archive/refs/tags/0.2.3.tar.gz
 ```
 
 **Previous Release (v0.1.8)**
@@ -174,7 +174,7 @@ zig fetch --save https://github.com/samooth/httpx.zig/archive/refs/tags/0.1.8.ta
 ```
 
 > [!WARNING]
-> Zig **0.15** is deprecated and supported only by **v0.0.7**. New projects should use **Zig 0.16.0+** with **httpx.zig v0.2.0**.
+> Zig **0.15** is deprecated and supported only by **v0.0.7**. New projects should use **Zig 0.16.0+** with **httpx.zig v0.2.3**.
 
 ### Method 2: Zig Fetch (Latest Development Build)
 
@@ -189,7 +189,7 @@ zig fetch --save git+https://github.com/samooth/httpx.zig.git
 ```zig
 .dependencies = .{
     .httpx = .{
-        .url = "https://github.com/samooth/httpx.zig/archive/refs/tags/0.2.0.tar.gz",
+        .url = "https://github.com/samooth/httpx.zig/archive/refs/tags/0.2.3.tar.gz",
         .hash = "...", // Run `zig fetch --save <url>` to generate the hash.
     },
 },
