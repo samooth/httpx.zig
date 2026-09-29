@@ -1658,7 +1658,7 @@ const TlsHandshakeDriver = struct {
         d.flight.appendSlice(conn.allocator, flight.certificateVerify) catch return Error.OutOfMemory;
         d.flight.appendSlice(conn.allocator, flight.finished) catch return Error.OutOfMemory;
 
-        const shared = d.engine.sharedSecret orelse return Error.TlsDriverFailed;
+        const shared = d.engine.sharedSecret32() orelse return Error.TlsDriverFailed;
         d.shared = shared;
         const chSh = hashConcat(&.{ chMsg, flight.serverHello });
         const hs = qtls.handshakeKeys(shared, chSh);
@@ -1702,7 +1702,7 @@ const TlsHandshakeDriver = struct {
             switch (rec.kind) {
                 @intFromEnum(ths.HandshakeType.server_hello) => {
                     d.engine.processServerHello(rec.msg) catch return Error.TlsDriverFailed;
-                    const shared = d.engine.sharedSecret orelse return Error.TlsDriverFailed;
+                    const shared = d.engine.sharedSecret32() orelse return Error.TlsDriverFailed;
                     d.shared = shared;
                     const chSh = hashConcat(&.{ d.flight.items, rec.msg });
                     const hs = qtls.handshakeKeys(shared, chSh);

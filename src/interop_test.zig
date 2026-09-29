@@ -218,28 +218,49 @@ test "interop: curl over HTTPS with SNI" {
 }
 
 test "interop: OpenSSL negotiates the post-quantum hybrid group" {
-    // DISABLED pending a server-side fix.
-    //
-    // The post-quantum port is client-side only. The server's ServerHello
-    // key_share is hardcoded to x25519 with a 32-byte length (see the
-    // ServerHello extension block in src/protocols/tls/engine.zig), so a
-    // client that offers only X25519MLKEM768 is rejected with
-    // `tls_parse_stoc_key_share: bad key share`. That is the default posture
-    // of OpenSSL 3.5+, so real clients will hit it.
-    //
-    // The blocker is not the arithmetic. One Engine serves every connection
-    // the acceptor thread takes, so it is shared state: hybrid state is
-    // per-handshake and cannot be parked on it, or concurrent handshakes
-    // hand each other a key_share for a group nobody offered. The state has
-    // to be threaded from the ClientHello parser to the ServerHello builder
-    // the way `peerShare` already is. See docs/reference/interop-status.md,
-    // which records what was ruled out so the same three dead ends are not
-    // walked again.
-    //
-    // Re-enable once the server can answer with a hybrid key_share: spawn
-    // `openssl s_client -groups X25519MLKEM768 -brief` against a TLS harness
-    // and require the group to be named back. It passes exactly when the
-    // server-side half of the port lands.
-    _ = hybrid_group;
-    return error.SkipZigTest;
+    if (skipUnlessInterop()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+
+    const ca_path = ".httpx-interop-ca.pem";
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, ca_path, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, interop_cert);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, ca_path) catch {};
+
+    var h = try Harness.start(a, io, true);
+    defer h.stop(a);
+
+    // Restricting to the hybrid is what makes this meaningful: with no
+    // fallback group offered, a server that can only answer x25519 has no
+    // move left, so this either negotiates the hybrid or fails loudly.
+    const addr = try std.fmt.allocPrint(a, "127.0.0.1:{d}", .{h.port});
+    defer a.free(addr);
+    const out = try runClient(a, io, &.{
+        "openssl",  "s_client",
+        "-connect", addr,
+        "-CAfile",  ca_path,
+        "-groups",  hybrid_group,
+        "-brief",
+    }, null);
+    defer a.free(out);
+
+    // Capability, not version: no runner ships OpenSSL 3.5, so an openssl
+    // that does not know the group says so rather than hanging. Detecting
+    // that keeps this test honest where it cannot yet prove anything.
+    const unknown_group = std.mem.indexOf(u8, out, "no such group") != null or
+        std.mem.indexOf(u8, out, "unknown group") != null or
+        std.mem.indexOf(u8, out, "unsupported group") != null or
+        std.mem.indexOf(u8, out, "no groups") != null;
+    if (unknown_group) {
+        std.debug.print("\n---OPENSSL-HYBRID (openssl lacks {s})---\n{s}\n---END---\n", .{ hybrid_group, out });
+        return error.SkipZigTest;
+    }
+
+    std.debug.print("\n---OPENSSL-HYBRID---\n{s}\n---END---\n", .{out});
+    try std.testing.expect(std.mem.indexOf(u8, out, hybrid_group) != null);
+    // `-brief` reports the result as `Verification: OK`, not the long form.
+    try std.testing.expect(std.mem.indexOf(u8, out, "Verification: OK") != null);
 }
