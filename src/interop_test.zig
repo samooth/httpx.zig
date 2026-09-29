@@ -19,6 +19,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const httpx = @import("httpx.zig");
+const clock = @import("common/clock.zig");
 
 const interop_cert = @embedFile("protocols/tls/testdata/localhostCert.pem");
 const interop_key = @embedFile("protocols/tls/testdata/localhostKey.pem");
@@ -281,4 +282,204 @@ test "interop: OpenSSL negotiates the post-quantum hybrid group" {
     try std.testing.expect(std.mem.indexOf(u8, out, hybrid_group) != null);
     // `-brief` reports the result as `Verification: OK`, not the long form.
     try std.testing.expect(std.mem.indexOf(u8, out, "Verification: OK") != null);
+}
+
+/// An `openssl s_server` pinned to a single group.
+///
+/// Restricting the server is what turns a completed handshake into evidence.
+/// With one group on offer there is nothing to fall back to, so a client that
+/// gets through used that group or did not get through. This is the mirror of
+/// the test above: there we are the server and OpenSSL picks the group, here
+/// OpenSSL is the server and we do. The `s_client` test alone only exercises
+/// the half of the key exchange we answer.
+const OpenSslServer = struct {
+    child: std.process.Child,
+    port: u16,
+    cert_path: []const u8,
+    key_path: []const u8,
+    out_path: []const u8,
+    reaped: bool = false,
+
+    const cert_file = ".httpx-interop-sserver-cert.pem";
+    const key_file = ".httpx-interop-sserver-key.pem";
+    const log_file = ".httpx-interop-sserver.log";
+
+    fn start(alloc: std.mem.Allocator, io: std.Io, group: ?[]const u8) !OpenSslServer {
+        {
+            var f = try std.Io.Dir.cwd().createFile(io, cert_file, .{});
+            defer f.close(io);
+            try f.writeStreamingAll(io, interop_cert);
+        }
+        {
+            var f = try std.Io.Dir.cwd().createFile(io, key_file, .{});
+            defer f.close(io);
+            try f.writeStreamingAll(io, interop_key);
+        }
+        errdefer std.Io.Dir.cwd().deleteFile(io, cert_file) catch {};
+        errdefer std.Io.Dir.cwd().deleteFile(io, key_file) catch {};
+
+        // Ask the OS for a free port, then hand it to OpenSSL. A listener
+        // bound to :0 is the only way to learn a port that is actually free;
+        // the window between closing it and OpenSSL binding is small and the
+        // readiness poll below covers a lost race.
+        var probe = try httpx.tcp.Listener.bind(io, 0);
+        const port = probe.localPort();
+        probe.close(io);
+
+        const accept = try std.fmt.allocPrint(alloc, "127.0.0.1:{d}", .{port});
+        defer alloc.free(accept);
+
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(alloc);
+        try argv.append(alloc, "openssl");
+        try argv.append(alloc, "s_server");
+        try argv.append(alloc, "-accept");
+        try argv.append(alloc, accept);
+        try argv.append(alloc, "-cert");
+        try argv.append(alloc, cert_file);
+        try argv.append(alloc, "-key");
+        try argv.append(alloc, key_file);
+        if (group) |g| {
+            try argv.append(alloc, "-groups");
+            try argv.append(alloc, g);
+        }
+        // No `-naccept` cap: the readiness probe below opens a connection of
+        // its own, and a one-shot server would spend its single accept on
+        // that and exit before the real client arrived. Lifetime is bounded by
+        // `deinit`, which kills it.
+        //
+        // Deliberately no `-brief`: on this build it writes nothing to a
+        // redirected stream, and it also suppresses the session counters that
+        // are the only usable diagnostic if the handshake fails.
+        try argv.append(alloc, "-www");
+
+        // Output goes to a file rather than a pipe. The server outlives the
+        // test body and is terminated, not shut down politely, so draining a
+        // pipe to EOF first would block forever and killing first would close
+        // the pipe unread. A file has neither problem: read it after the kill.
+        const log = try std.Io.Dir.cwd().createFile(io, log_file, .{});
+        defer log.close(io);
+
+        var child = try std.process.spawn(io, .{
+            .argv = argv.items,
+            .stdin = .ignore,
+            .stdout = .{ .file = log },
+            .stderr = .{ .file = log },
+        });
+        errdefer child.kill(io);
+
+        var self: OpenSslServer = .{
+            .child = child,
+            .port = port,
+            .cert_path = cert_file,
+            .key_path = key_file,
+            .out_path = log_file,
+        };
+        try self.waitUntilListening(io);
+        return self;
+    }
+
+    /// Blocks until the server accepts connections, or gives up.
+    ///
+    /// `spawn` returning is not the same as the port being bound, and
+    /// `-accept` is a race with our own connect: without this the client
+    /// reliably wins it and reports `ConnectionRefused` for a server that
+    /// works. Probing with a plain TCP connect also proves the listener is
+    /// serving, not merely that the process exists.
+    fn waitUntilListening(self: *OpenSslServer, io: std.Io) !void {
+        // Bounded by iteration count rather than a deadline: it is the same
+        // ~20s of wall clock either way, and counting retries needs no clock.
+        var attempt: usize = 0;
+        while (attempt < 1000) : (attempt += 1) {
+            if (httpx.tcp.connect(io, "127.0.0.1", self.port)) |sock| {
+                var s = sock;
+                s.close();
+                return;
+            } else |_| {}
+            clock.sleepMillis(20);
+        }
+        return error.OpenSslServerNeverListened;
+    }
+
+    /// Reaps the child and returns everything it printed, stdout and stderr
+    /// together. Kills it first if it is still running: a failed handshake on
+    /// our side can leave OpenSSL waiting, and a test must not hang on that.
+    /// Terminates the server and returns everything it wrote to its log.
+    ///
+    /// `Child.kill` already blocks until the process is gone and reaps it, so
+    /// there is no `wait` to follow: calling one would assert on a process id
+    /// that no longer exists.
+    fn output(self: *OpenSslServer, alloc: std.mem.Allocator, io: std.Io) ![]u8 {
+        if (!self.reaped) {
+            self.child.kill(io);
+            self.reaped = true;
+        }
+
+        const file = try std.Io.Dir.cwd().openFile(io, self.out_path, .{});
+        defer file.close(io);
+        const stat = try file.stat(io);
+        const len: usize = @intCast(stat.size);
+        if (len == 0) return alloc.alloc(u8, 0);
+        // The process is gone, so the size is final: allocate exactly that and
+        // read it in one call rather than growing a buffer we cannot predict.
+        const buf = try alloc.alloc(u8, len);
+        errdefer alloc.free(buf);
+        const n = try file.readPositionalAll(io, buf, 0);
+        return buf[0..n];
+    }
+
+    fn deinit(self: *OpenSslServer, alloc: std.mem.Allocator, io: std.Io) void {
+        if (!self.reaped) {
+            self.child.kill(io);
+            self.reaped = true;
+        }
+        std.Io.Dir.cwd().deleteFile(io, self.cert_path) catch {};
+        std.Io.Dir.cwd().deleteFile(io, self.key_path) catch {};
+        std.Io.Dir.cwd().deleteFile(io, self.out_path) catch {};
+        _ = alloc;
+    }
+};
+
+test "interop: our client completes a post-quantum handshake with openssl s_server" {
+    if (skipUnlessInterop()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+
+    if (!opensslKnowsGroup(a, io, hybrid_group)) {
+        std.debug.print("\n---OPENSSL-SSERVER-HYBRID (openssl lacks {s})---\n---END---\n", .{hybrid_group});
+        return error.SkipZigTest;
+    }
+
+    var srv = try OpenSslServer.start(a, io, hybrid_group);
+    defer srv.deinit(a, io);
+
+    // The test certificate is self-signed and for 127.0.0.1, so it is its own
+    // trust anchor here exactly as it is for the `s_client` test.
+    var client = httpx.Client.init(a, io, .{
+        .tls = .{ .verify = .selfSigned },
+    });
+    defer client.deinit();
+
+    const url = try std.fmt.allocPrint(a, "https://127.0.0.1:{d}/", .{srv.port});
+    defer a.free(url);
+
+    // The status code is the whole proof, and the pinning is what makes it
+    // one. OpenSSL is started with `-groups X25519MLKEM768` and nothing else,
+    // so it has no group to fall back to: a request that comes back at all was
+    // carried by the hybrid. A client that failed to offer it does not get a
+    // weaker handshake, it gets `no suitable key share` and no response.
+    //
+    // Asserting the group name out of OpenSSL's own output would read better,
+    // but `s_server -brief` writes nothing at all to a redirected stream --
+    // measured, not assumed -- so there is nothing to read. The session stats
+    // it does print are kept for diagnosis and are not the assertion.
+    const resp_const = try client.get(url, .{});
+    var resp = resp_const;
+    defer resp.deinit();
+
+    const out = try srv.output(a, io);
+    defer a.free(out);
+    std.debug.print("\n---OPENSSL-SSERVER-HYBRID---\n{s}\n---END---\n", .{out});
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
 }
