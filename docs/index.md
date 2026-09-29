@@ -81,10 +81,10 @@ What real third-party clients do against httpx, including known gaps: [Interop S
 
 ### Method 1: Zig Fetch (Recommended)
 
-**Latest Release (v0.2.3)**
+**Latest Release (v0.2.4)**
 
 ```bash
-zig fetch --save https://github.com/samooth/httpx.zig/archive/refs/tags/0.2.3.tar.gz
+zig fetch --save https://github.com/samooth/httpx.zig/archive/refs/tags/0.2.4.tar.gz
 ```
 
 **Previous Release (v0.1.8)**
@@ -94,9 +94,9 @@ zig fetch --save https://github.com/samooth/httpx.zig/archive/refs/tags/0.1.8.ta
 ```
 
 > [!WARNING]
-> Zig **0.15** is deprecated and supported only by **v0.0.7**. New projects should use **Zig 0.16.0+** with **httpx.zig v0.2.3**.
+> Zig **0.15** is deprecated and supported only by **v0.0.7**. New projects should use **Zig 0.16.0+** with **httpx.zig v0.2.4**.
 
-### Method 2: Zig Fetch (Latest / v0.2.3)
+### Method 2: Zig Fetch (Latest / v0.2.4)
 
 Use this for the latest in-development version from the `main` branch:
 
@@ -109,7 +109,7 @@ zig fetch --save git+https://github.com/samooth/httpx.zig.git
 ```zig
 .dependencies = .{
   .httpx = .{
-    .url = "https://github.com/samooth/httpx.zig/archive/refs/tags/0.2.3.tar.gz",
+    .url = "https://github.com/samooth/httpx.zig/archive/refs/tags/0.2.4.tar.gz",
     .hash = "...",
   },
 },
