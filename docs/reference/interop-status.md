@@ -76,6 +76,39 @@ The interop test that would catch this is written and disabled in
 `src/interop_test.zig`, with the reason recorded inline, so it passes the
 moment the server half lands.
 
+Two attempts to add the server half are recorded in
+`/tmp/opencode/mlkem-server-v4.patch` territory and were reverted. Both broke
+roughly 30 tests, which turns out to be one failure: a hang, not 30. The
+constraint below is the reason, and it is not currently written down anywhere
+in the source.
+
+### The `Engine` is shared across connections
+
+One `Server` — and therefore one `Engine` — serves every connection the
+acceptor thread takes. It is shared state, not per-connection state. Anything
+that belongs to a single handshake cannot live on it.
+
+Hybrid state does belong to a single handshake: the client's public key, the
+ciphertext we encapsulate to it, and which group we selected. Storing those on
+the `Engine` means concurrent handshakes overwrite each other's values, one
+connection receives a `ServerHello` carrying a `key_share` for a group it never
+offered, and the client waits forever. In `zig build test` the global timeout
+then kills the run, so every test after the hang reports as failed and the real
+failure is buried.
+
+What was ruled out along the way, each by measurement rather than reasoning:
+growing `Engine` with a 1.2 KB inline array, the resulting stack pressure, and
+allocator calls inside the handshake path racing `DebugAllocator`'s mutex. All
+three failed the same way, and all three are red herrings. Only the shared-state
+violation explains it.
+
+The fix therefore has to thread the hybrid state explicitly from the ClientHello
+parser to the ServerHello builder, the way `peerShare` already is, rather than
+parking it on the `Engine`. The obstacle is that the ciphertext is 1.2 KB and
+should not be passed by value, so it wants a small handle — a pointer into
+handshake-owned storage, or a buffer reused under the lock that already
+serialises access to the shared `Engine`.
+
 ## A note on the post-quantum test
 
 `X25519MLKEM768` needs OpenSSL 3.5 or later, and no GitHub runner ships it:

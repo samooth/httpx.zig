@@ -223,14 +223,23 @@ test "interop: OpenSSL negotiates the post-quantum hybrid group" {
     // The post-quantum port is client-side only. The server's ServerHello
     // key_share is hardcoded to x25519 with a 32-byte length (see the
     // ServerHello extension block in src/protocols/tls/engine.zig), so a
-    // client that offers only X25519MLKEM768 gets it rejected with
+    // client that offers only X25519MLKEM768 is rejected with
     // `tls_parse_stoc_key_share: bad key share`. That is the default posture
     // of OpenSSL 3.5+, so real clients will hit it.
     //
-    // Re-enable this once the server can answer with a hybrid key_share:
-    // spawn `openssl s_client -groups X25519MLKEM768 -brief` against a TLS
-    // harness and require the group to be named back. It passes exactly when
-    // the server-side half of the port lands.
+    // The blocker is not the arithmetic. One Engine serves every connection
+    // the acceptor thread takes, so it is shared state: hybrid state is
+    // per-handshake and cannot be parked on it, or concurrent handshakes
+    // hand each other a key_share for a group nobody offered. The state has
+    // to be threaded from the ClientHello parser to the ServerHello builder
+    // the way `peerShare` already is. See docs/reference/interop-status.md,
+    // which records what was ruled out so the same three dead ends are not
+    // walked again.
+    //
+    // Re-enable once the server can answer with a hybrid key_share: spawn
+    // `openssl s_client -groups X25519MLKEM768 -brief` against a TLS harness
+    // and require the group to be named back. It passes exactly when the
+    // server-side half of the port lands.
     _ = hybrid_group;
     return error.SkipZigTest;
 }
