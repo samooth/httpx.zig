@@ -167,10 +167,10 @@ zig build -Dtarget=x86-windows
 zig fetch --save https://github.com/samooth/httpx.zig/archive/refs/tags/0.2.4.tar.gz
 ```
 
-**Previous Release (v0.1.8)**
+**Previous Release (v0.2.3)**
 
 ```bash
-zig fetch --save https://github.com/samooth/httpx.zig/archive/refs/tags/0.1.8.tar.gz
+zig fetch --save https://github.com/samooth/httpx.zig/archive/refs/tags/0.2.3.tar.gz
 ```
 
 > [!WARNING]
