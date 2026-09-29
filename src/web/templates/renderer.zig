@@ -2134,6 +2134,15 @@ pub const Renderer = struct {
         var scope = contextMod.Scope{};
         const arenaAlloc = ctx.arena.allocator();
         defer scope.deinit(arenaAlloc);
+        // Not `arenaAlloc`, and the name is a trap: on an ArenaAllocator,
+        // `child_allocator` is the existing allocator the arena wraps, not an
+        // allocator for child allocations. So the table's own bookkeeping is
+        // charged to the parent and freed here, while the scope above lives in
+        // the arena. That is deliberate -- the table is bounded by the number
+        // of macros rather than by the render, so there is no reason to grow
+        // the arena for it. It does mean the `defer` is load-bearing: drop it
+        // and the leak lands in the parent allocator, where nothing sweeps it,
+        // instead of in the arena that the next render would reuse.
         var macros = MacroTable.init(ctx.arena.child_allocator);
         defer macros.deinit();
         for (ast.macros) |m| try macros.addIfAbsent(m);
