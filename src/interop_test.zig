@@ -37,6 +37,26 @@ fn skipUnlessInterop() bool {
     return !interopEnabled();
 }
 
+/// Whether this `openssl` can be asked for `group` at all.
+///
+/// X25519MLKEM768 arrived in OpenSSL 3.5, and no CI runner ships it: macOS
+/// provides LibreSSL, Ubuntu 24.04 provides 3.0.13. So the question has to
+/// be asked of the binary rather than of the version, because a
+/// distribution backport would answer "no" to the version and "yes" here.
+///
+/// Asks positively -- does the group appear in the library's group list --
+/// instead of reading the error text. Matching on rejection messages is a
+/// guess about wording that varies by version: 3.0 rejects with
+/// `group 'X25519MLKEM768' cannot be set` after
+/// `SSL_CONF_cmd(-groups, ...) failed`, which matched none of the strings
+/// the test used to look for, so the hybrid test failed on Ubuntu instead of
+/// skipping. A positive lookup cannot miss that way.
+fn opensslKnowsGroup(alloc: std.mem.Allocator, io: std.Io, group: []const u8) bool {
+    const listing = runClient(alloc, io, &.{ "openssl", "list", "-kem-algorithms" }, null) catch return false;
+    defer alloc.free(listing);
+    return std.mem.indexOf(u8, listing, group) != null;
+}
+
 /// Runs `argv`, feeding it `input` on stdin, and returns stdout and stderr
 /// concatenated. Never rejects on a non-zero exit: a failing client is a
 /// result to assert on, not an error in the test.
@@ -222,6 +242,16 @@ test "interop: OpenSSL negotiates the post-quantum hybrid group" {
     const a = std.testing.allocator;
     const io = std.testing.io;
 
+    // Asked before anything is set up: this is a property of the local
+    // openssl, so there is no reason to write a certificate or bind a port
+    // to find out. Where the group is missing the post-quantum path is
+    // untestable rather than broken, and skipping says exactly that -- it
+    // failed the run before by not being detected.
+    if (!opensslKnowsGroup(a, io, hybrid_group)) {
+        std.debug.print("\n---OPENSSL-HYBRID (openssl lacks {s})---\n---END---\n", .{hybrid_group});
+        return error.SkipZigTest;
+    }
+
     const ca_path = ".httpx-interop-ca.pem";
     {
         var f = try std.Io.Dir.cwd().createFile(io, ca_path, .{});
@@ -246,18 +276,6 @@ test "interop: OpenSSL negotiates the post-quantum hybrid group" {
         "-brief",
     }, null);
     defer a.free(out);
-
-    // Capability, not version: no runner ships OpenSSL 3.5, so an openssl
-    // that does not know the group says so rather than hanging. Detecting
-    // that keeps this test honest where it cannot yet prove anything.
-    const unknown_group = std.mem.indexOf(u8, out, "no such group") != null or
-        std.mem.indexOf(u8, out, "unknown group") != null or
-        std.mem.indexOf(u8, out, "unsupported group") != null or
-        std.mem.indexOf(u8, out, "no groups") != null;
-    if (unknown_group) {
-        std.debug.print("\n---OPENSSL-HYBRID (openssl lacks {s})---\n{s}\n---END---\n", .{ hybrid_group, out });
-        return error.SkipZigTest;
-    }
 
     std.debug.print("\n---OPENSSL-HYBRID---\n{s}\n---END---\n", .{out});
     try std.testing.expect(std.mem.indexOf(u8, out, hybrid_group) != null);
