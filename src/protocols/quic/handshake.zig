@@ -679,7 +679,7 @@ pub fn serveHandshake(serverEp: *Endpoint, pump: *transportMod.Pump, driver: ?*D
             const parsed = packetMod.parseLongHeader(d.data) catch continue;
             if (parsed.header.type != .initial) continue;
             serverEp.peer = d.from;
-            try serverEp.conn.acceptInitial(parsed.header.dcid);
+            try serverEp.conn.acceptInitial(parsed.header.dcid, parsed.header.version);
             serverEp.conn.receiveDatagram(d.data, now) catch continue;
             booted = true;
             continue;
@@ -776,7 +776,7 @@ pub fn performHandshakeWithEarlyData(
                 const parsed = packetMod.parseLongHeader(d.data) catch continue;
                 if (parsed.header.type != .initial) continue;
                 sep.peer = d.from;
-                try sep.conn.acceptInitial(parsed.header.dcid);
+                try sep.conn.acceptInitial(parsed.header.dcid, parsed.header.version);
                 sep.conn.receiveDatagram(d.data, now) catch continue;
                 serverBooted = true;
                 continue;

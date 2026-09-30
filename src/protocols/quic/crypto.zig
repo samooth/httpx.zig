@@ -233,3 +233,30 @@ test "RFC 9001 A.1/A.2 initial secrets and keys (authoritative vectors)" {
     try std.testing.expectEqualSlices(u8, &wantSiv, &spk.iv);
     try std.testing.expectEqualSlices(u8, &wantShp, spk.hp[0..16]);
 }
+
+fn hexEq(got: []const u8, want_hex: []const u8) !void {
+    var want: [64]u8 = undefined;
+    if (want_hex.len > want.len) return error.TestExpectedSmallerOutput;
+    _ = std.fmt.hexToBytes(&want, want_hex) catch return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, want[0..got.len], got);
+}
+
+test "initial secrets match the RFC 9001 A.2 test vector" {
+    // Client Initial, original destination connection id from the RFC. If this
+    // drifts, every peer's first packet fails AEAD validation and there is no
+    // symptom more specific than "AuthenticationFailed".
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const secrets = try initialSecrets(&dcid, 0x00000001);
+
+    try hexEq(&secrets.client, "c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea");
+
+    const ck = initialProtection(secrets, .client);
+    try hexEq(ck.key[0..ck.keyLen], "1f369613dd76d5467730efcbe3b1a22d");
+    try hexEq(&ck.iv, "fa044b2f42a3fd3b46fb255c");
+    try hexEq(ck.hp[0..ck.hpLen], "9f50449e04a0e810283a1e9933adedd2");
+
+    const sk = initialProtection(secrets, .server);
+    try hexEq(sk.key[0..sk.keyLen], "cf3a5331653c364c88f0f379b6067e37");
+    try hexEq(&sk.iv, "0ac1493ca1905853b0bba03e");
+    try hexEq(sk.hp[0..sk.hpLen], "c206b8d9b9f0f37644430b490eeaa314");
+}

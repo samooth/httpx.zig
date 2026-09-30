@@ -168,6 +168,10 @@ pub const QueuedControl = struct {
 pub const Connection = struct {
     allocator: Allocator,
     role: Role,
+    /// QUIC version of the packet that established this connection.
+    /// Determines which initial salt applies (RFC 9001 5.2, RFC 9369).
+    /// Defaults to v1 for callers that construct a Connection directly.
+    version: u32 = 0x00000001,
     cfg: Config,
     cbs: Callbacks = .{},
     tls: TlsDriver = .{},
@@ -344,8 +348,19 @@ pub const Connection = struct {
     // Key installation (driven by TLS driver)
 
     /// Installs Initial keys derived from the original DCID.
+    /// Derives Initial protection keys from the connection's version.
+    ///
+    /// The salt is version-specific: v2 (RFC 9369) uses a different one from
+    /// v1, so this used to derive v1 keys unconditionally, which made
+    /// `initialSaltV2` unreachable and would fail AEAD validation on the very
+    /// first packet of any peer that negotiated v2.
+    ///
+    /// Note this was found while chasing a different failure, not this one:
+    /// the peer that exposed it offered [v1, v2] but actually sent v1, so its
+    /// Initial keys were derived correctly either way. The bug is real and
+    /// the plumbing was needed to prove it was not the culprit.
     pub fn installInitialKeys(self: *Connection) Error!void {
-        const secrets = crypto.initialSecrets(self.dcid[0..self.dcidLen], 0x00000001) catch return Error.TlsDriverFailed;
+        const secrets = crypto.initialSecrets(self.dcid[0..self.dcidLen], self.version) catch return Error.TlsDriverFailed;
         const sp = &self.spaces[0];
         sp.keysTx = if (self.role == .client)
             crypto.initialProtection(secrets, .client)
@@ -1395,10 +1410,13 @@ pub const Connection = struct {
 
     /// Server-side entry: install Initial keys from the DCID seen on the
     /// first datagram before processing it.
-    pub fn acceptInitial(self: *Connection, clientDcid: []const u8) Error!void {
+    /// `version` is the one from the peer's first long header; it selects the
+    /// initial salt. Defaults to v1 so direct callers keep their behaviour.
+    pub fn acceptInitial(self: *Connection, clientDcid: []const u8, version: u32) Error!void {
         if (self.role != .server) return Error.ProtocolViolation;
         @memcpy(self.dcid[0..clientDcid.len], clientDcid);
         self.dcidLen = @intCast(clientDcid.len);
+        self.version = version;
         self.installInitialKeys() catch return Error.TlsDriverFailed;
     }
 
@@ -1519,7 +1537,7 @@ test "loopback connection pair completes protected handshake and stream" {
     try std.testing.expect(cOut.len >= 64);
 
     // Server accepts based on the DCID the client used.
-    try server.acceptInitial(client.dcid[0..8]);
+    try server.acceptInitial(client.dcid[0..8], 0x00000001);
     try server.receiveDatagram(cOut, 100);
 
     // Server produced Handshake + Application responses.
@@ -1770,7 +1788,7 @@ fn runTlsHandshake(
     defer a.free(c0);
     try std.testing.expect(c0.len >= 64);
 
-    try server.acceptInitial(client.dcid[0..8]);
+    try server.acceptInitial(client.dcid[0..8], 0x00000001);
     try server.receiveDatagram(c0, 100);
 
     const s0 = try server.takeOutput(a);
