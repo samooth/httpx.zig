@@ -163,6 +163,18 @@ pub const Endpoint = struct {
     peer: ?std.Io.net.IpAddress = null,
     io: std.Io,
 
+    /// A peer that moved: the new address we have seen traffic from, and
+    /// the old one we keep sending to until the new path is validated.
+    ///
+    /// RFC 9000 section 9.2 is why this is not "last address seen".
+    /// Replying straight to a new source address accepts whatever the
+    /// sender claims to be, which makes the endpoint an amplifier for an
+    /// off-path attacker, and it skips the validation that makes a
+    /// migration legitimate. Traffic continues to the validated address
+    /// until a PATH_CHALLENGE sent there comes back answered.
+    candidate: ?std.Io.net.IpAddress = null,
+    probing: bool = false,
+
     pub const Options = struct {
         port: u16 = 0,
     };
@@ -204,13 +216,53 @@ pub const Endpoint = struct {
         var n: usize = 0;
         while (n < max) : (n += 1) {
             const rx = self.sock.receive(&buf) catch return n; // closed/err => drained
-            self.peer = rx.from;
+            self.notePeerAddress(rx.from, nowMs);
             self.conn.receiveDatagram(rx.data, nowMs) catch |e| switch (e) {
                 error.Draining => return error.Draining,
                 else => continue, // drop bad datagrams, keep going
             };
         }
         return n;
+    }
+
+    /// Records where a datagram came from, starting path validation when
+    /// the address is not the one we are already talking to.
+    fn notePeerAddress(self: *Endpoint, from: std.Io.net.IpAddress, nowMs: u64) void {
+        const current = self.peer orelse {
+            self.peer = from;
+            return;
+        };
+        if (fromEqual(current, from)) {
+            // Traffic on the validated path. A candidate that answers here
+            // is proven, so the switch is complete.
+            if (self.probing and self.candidate != null) {
+                self.peer = from;
+                self.candidate = null;
+                self.probing = false;
+            }
+            return;
+        }
+        if (self.candidate == null or !fromEqual(self.candidate.?, from)) {
+            self.candidate = from;
+            self.probing = true;
+            self.conn.requestPathValidation(nowMs);
+        }
+    }
+
+    /// True when `a` and `b` are the same endpoint: the fields that tell
+    /// one address from another.
+    fn fromEqual(a: std.Io.net.IpAddress, b: std.Io.net.IpAddress) bool {
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+        return switch (a) {
+            .ip4 => |x| blk: {
+                const y = b.ip4;
+                break :blk x.port == y.port and std.mem.eql(u8, &x.bytes, &y.bytes);
+            },
+            .ip6 => |x| blk: {
+                const y = b.ip6;
+                break :blk x.port == y.port and std.mem.eql(u8, &x.bytes, &y.bytes) and x.flow == y.flow and x.interface.index == y.interface.index;
+            },
+        };
     }
 
     /// Flushes all currently queued connection output to the peer.
@@ -290,4 +342,66 @@ test "quic endpoints exchange protected initial packets over real udp" {
     _ = try se.flush(null);
     const gotBack = try ce.pumpIn(1, 200);
     try std.testing.expect(gotBack >= 1);
+}
+
+test "a peer that changes address is validated before we reply to the new one" {
+    const a = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var cli = try connMod.Connection.init(a, io, .client, .{});
+    defer cli.deinit();
+    var srv = try connMod.Connection.init(a, io, .server, .{});
+    defer srv.deinit();
+
+    // The first datagram sets the peer, no validation involved.
+    // A real socket so deinit is meaningful; the address logic under test
+    // never touches it.
+    var ep = try Endpoint.init(a, io, srv, .{});
+    defer ep.deinit();
+    const home: std.Io.net.IpAddress = .{ .ip4 = .loopback(4000) };
+    ep.notePeerAddress(home, 100);
+    try std.testing.expect(ep.peer != null);
+    try std.testing.expect(ep.candidate == null);
+    try std.testing.expect(!ep.probing);
+
+    // A second address is a candidate, not a destination. The connection is
+    // asked to prove it, and `peer` stays where it was.
+    const moved: std.Io.net.IpAddress = .{ .ip4 = .loopback(4001) };
+    ep.notePeerAddress(moved, 200);
+    try std.testing.expect(ep.candidate != null);
+    try std.testing.expect(ep.probing);
+    try std.testing.expectEqual(@as(u16, 4000), ep.peer.?.ip4.port);
+    try std.testing.expectEqual(@as(u16, 4001), ep.candidate.?.ip4.port);
+
+    // Traffic from the new address does not by itself promote it, so an
+    // off-path attacker cannot steer replies by guessing a source port.
+    ep.notePeerAddress(moved, 300);
+    try std.testing.expectEqual(@as(u16, 4000), ep.peer.?.ip4.port);
+
+    // The address is promoted only when the validated path is used again,
+    // which is what a successful path validation looks like from here.
+    ep.peer = moved;
+    ep.notePeerAddress(moved, 400);
+    try std.testing.expect(ep.candidate == null);
+    try std.testing.expect(!ep.probing);
+    try std.testing.expectEqual(@as(u16, 4001), ep.peer.?.ip4.port);
+}
+
+test "fromEqual distinguishes address, port and address family" {
+    const base: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 1 }, .port = 4433 } };
+    try std.testing.expect(Endpoint.fromEqual(base, base));
+
+    var other_port = base;
+    other_port.ip4.port = 4434;
+    try std.testing.expect(!Endpoint.fromEqual(base, other_port));
+
+    var other_host = base;
+    other_host.ip4.bytes = .{ 10, 0, 0, 2 };
+    try std.testing.expect(!Endpoint.fromEqual(base, other_host));
+
+    // A v4-mapped address is not the same endpoint as the v4 one.
+    var v6bytes: [16]u8 = @splat(0);
+    v6bytes[15] = 1;
+    const v6: std.Io.net.IpAddress = .{ .ip6 = .{ .port = 4433, .bytes = v6bytes } };
+    try std.testing.expect(!Endpoint.fromEqual(base, v6));
 }

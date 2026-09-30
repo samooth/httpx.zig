@@ -219,6 +219,14 @@ pub const Connection = struct {
 
     // Peer CID table (NEW_CONNECTION_ID entries).
     peerCids: std.ArrayList(CidEntry) = .empty,
+
+    // Connection IDs we have issued, including the one in use. The peer
+    // needs a spare set to migrate with: RFC 9000 section 9.1 is
+    // explicit that a migrated path must not reuse the same CID, or the
+    // change of address becomes trivially linkable to the old one.
+    localCids: std.ArrayList(CidEntry) = .empty,
+    nextCidSeq: u64 = 1,
+    cidsIssued: bool = false,
     retirePriorTo: u64 = 0,
 
     // Stream-level flow control and reorder buffers.
@@ -320,6 +328,12 @@ pub const Connection = struct {
         for (&self.cryptoPending) |*b| b.* = .empty;
         self.outbuf = .empty;
         self.peerCids = .empty;
+        self.localCids = .empty;
+        self.localCids.append(self.allocator, .{
+            .sequence = 0,
+            .cidLen = @intCast(self.scidLen),
+            .cid = self.scid,
+        }) catch return error.OutOfMemory;
         self.maxStreamData = std.AutoHashMap(u64, u64).init(allocator);
         self.recvStreamEnd = std.AutoHashMap(u64, u64).init(allocator);
         self.sendStreamEnd = std.AutoHashMap(u64, u64).init(allocator);
@@ -349,6 +363,7 @@ pub const Connection = struct {
         }
         self.outbuf.deinit(self.allocator);
         self.peerCids.deinit(self.allocator);
+        self.localCids.deinit(self.allocator);
         self.maxStreamData.deinit();
         self.recvStreamEnd.deinit();
         self.sendStreamEnd.deinit();
@@ -971,6 +986,9 @@ pub const Connection = struct {
         // Probing needs 1-RTT keys and a peer whose limits we know.
         if (self.state == .established and self.spaces[2].keysTx != null and self.peerParams != null) {
             self.maybeProbePath(nowMs) catch {};
+            if (self.state == .established and !self.cidsIssued and self.peerParams != null) {
+                self.issueConnectionIds(nowMs) catch {};
+            }
         }
         for (&self.spaces, 0..) |*sp, idx| {
             if (sp.lossTimeMs) |lt| {
@@ -1079,6 +1097,87 @@ pub const Connection = struct {
     /// than `pathMtu` (RFC 9000 section 14.2, step 3). Padding to the target
     /// is what makes the test meaningful: a small packet would fit
     /// regardless, so a loss shows up as a missing PATH_RESPONSE.
+    /// Applies a RETIRE_CONNECTION_ID, split out so the retirement rule can
+    /// be tested without assembling a full packet.
+    fn handleRetireForTest(self: *Connection, sequence: u64, nowMs: u64) Error!void {
+        var found = false;
+        for (self.localCids.items) |*c| {
+            if (c.sequence != sequence) continue;
+            if (c.retired) return Error.ProtocolViolation;
+            c.retired = true;
+            found = true;
+        }
+        if (!found) return Error.ProtocolViolation;
+        self.cidsIssued = false;
+        _ = nowMs;
+    }
+
+    /// How many connection IDs we keep available to the peer, per its
+    /// active_connection_id_limit. RFC 9000 section 5.1.1 requires at least
+    /// two, so there is always one to migrate to while the old one is still
+    /// in use.
+    fn cidTarget(self: *const Connection) usize {
+        const limit: usize = if (self.peerParams) |p|
+            @min(@as(usize, @intCast(p.activeConnectionIdLimit)), MAX_PEER_CONNECTION_IDS)
+        else
+            2;
+        return @max(limit, 2);
+    }
+
+    /// Issues spare connection IDs so the peer can migrate onto a new path
+    /// without reusing the CID that identified the old one (RFC 9000
+    /// section 9.1). Runs once the handshake is done, when the peer's
+    /// active_connection_id_limit is known and 1-RTT frames can be sent.
+    fn issueConnectionIds(self: *Connection, nowMs: u64) Error!void {
+        const target = self.cidTarget();
+        var active: usize = 0;
+        for (self.localCids.items) |c| {
+            if (!c.retired) active += 1;
+        }
+        while (active < target) : (active += 1) {
+            var entry = CidEntry{
+                .sequence = self.nextCidSeq,
+                .cidLen = @intCast(self.scidLen),
+            };
+            self.nextCidSeq += 1;
+            self.io.randomSecure(&entry.cid) catch |e| switch (e) {
+                error.EntropyUnavailable, error.Canceled => return Error.TlsDriverFailed,
+            };
+            // A reset token lets the peer recognise a stateless reset as
+            // belonging to this connection rather than an orphan packet.
+            self.io.randomSecure(&entry.statelessResetToken) catch |e| switch (e) {
+                error.EntropyUnavailable, error.Canceled => return Error.TlsDriverFailed,
+            };
+            self.queueControlFrame(.{ .newConnectionId = .{
+                .sequence = entry.sequence,
+                .retirePriorTo = self.nextCidSeq,
+                .cid = entry.cid[0..entry.cidLen],
+                .statelessResetToken = entry.statelessResetToken,
+            } }) catch |e| switch (e) {
+                error.OutOfMemory => return Error.OutOfMemory,
+                else => return Error.ProtocolViolation,
+            };
+            self.localCids.append(self.allocator, entry) catch return Error.OutOfMemory;
+        }
+        self.cidsIssued = true;
+        self.flushControl(.application, nowMs) catch |e| switch (e) {
+            error.OutOfMemory => return Error.OutOfMemory,
+            else => {},
+        };
+    }
+
+    /// Forces a PATH_CHALLENGE on the next tick, bypassing the interval
+    /// that paces MTU probing. Used when the peer appears to have moved: the
+    /// new path has to be proven before we treat it as the real one
+    /// (RFC 9000 section 9.2).
+    pub fn requestPathValidation(self: *Connection, nowMs: u64) void {
+        if (self.spaces[2].keysTx == null) return; // nothing to probe with yet
+        // Reset the pacing so the challenge is not delayed by an unrelated
+        // probe sent moments ago, and target the address we already trust.
+        self.probeOutstanding = false;
+        self.probeSentMs = nowMs -| PROBE_INTERVAL_MS;
+    }
+
     fn maybeProbePath(self: *Connection, nowMs: u64) Error!void {
         if (self.probeOutstanding) return;
         if (self.probeTarget == 0) self.probeTarget = @min(self.pathMtu * 2, self.maxSendDatagramCeiling());
@@ -1507,8 +1606,21 @@ pub const Connection = struct {
                     if (!entry.retired and activeCount >= MAX_PEER_CONNECTION_IDS) return Error.ProtocolViolation;
                     self.peerCids.append(self.allocator, entry) catch return Error.OutOfMemory;
                 },
-                .retireConnectionId => {
-                    // Mark our CID with the given sequence as retired.
+                .retireConnectionId => |r| {
+                    // RFC 9000 section 19.16: stop using that CID, and
+                    // hand the peer a replacement so the active set does not
+                    // shrink below what it expects. A sequence we never
+                    // issued is a protocol violation.
+                    var found = false;
+                    for (self.localCids.items) |*c| {
+                        if (c.sequence != r.sequence) continue;
+                        if (c.retired) return Error.ProtocolViolation;
+                        c.retired = true;
+                        found = true;
+                    }
+                    if (!found) return Error.ProtocolViolation;
+                    // Reissue to keep the count the peer is entitled to.
+                    self.cidsIssued = false;
                 },
                 .stopSending => |s| {
                     // RFC 9000 section 19.5: answer with RESET_STREAM at
@@ -3117,4 +3229,66 @@ test "an oversized datagram is dropped without killing the connection" {
         else => {},
     };
     try std.testing.expectEqual(State.established, cli.state);
+}
+
+test "we issue spare connection ids so the peer can migrate off ours" {
+    const a = std.testing.allocator;
+    var cli = try Connection.init(a, std.Io.Threaded.global_single_threaded.io(), .client, .{});
+    defer cli.deinit();
+    try cli.installKeys(.application, @splat(0xA1), @splat(0xB2));
+    cli.state = .established;
+
+    // The CID in use counts towards the limit, and RFC 9000 5.1.1 floors
+    // the limit at two, so at least one spare is always owed.
+    try std.testing.expectEqual(@as(usize, 2), cli.cidTarget());
+    try std.testing.expectEqual(@as(usize, 1), cli.localCids.items.len);
+    try std.testing.expectEqual(@as(u64, 0), cli.localCids.items[0].sequence);
+
+    cli.peerParams = paramsMod.Params{ .activeConnectionIdLimit = 4 };
+    try std.testing.expectEqual(@as(usize, 4), cli.cidTarget());
+
+    try cli.issueConnectionIds(100);
+    try std.testing.expectEqual(@as(usize, 4), cli.localCids.items.len);
+    try std.testing.expect(cli.cidsIssued);
+
+    // Spare IDs are fresh and unpredictable, and none repeats.
+    for (cli.localCids.items[1..]) |c| {
+        try std.testing.expect(c.sequence > 0);
+        for (cli.localCids.items) |other| {
+            if (other.sequence == c.sequence) continue;
+            try std.testing.expect(!std.mem.eql(u8, other.cid[0..other.cidLen], c.cid[0..c.cidLen]));
+        }
+    }
+}
+
+test "retiring one of our connection ids triggers a replacement" {
+    const a = std.testing.allocator;
+    var srv = try Connection.init(a, std.Io.Threaded.global_single_threaded.io(), .server, .{});
+    defer srv.deinit();
+    try srv.installKeys(.application, @splat(0xA1), @splat(0xB2));
+    srv.state = .established;
+    srv.peerParams = paramsMod.Params{ .activeConnectionIdLimit = 3 };
+    try srv.issueConnectionIds(100);
+    const issued = srv.localCids.items.len;
+    try std.testing.expectEqual(@as(usize, 3), issued);
+
+    // The peer retires the first spare.
+    const victim = srv.localCids.items[1].sequence;
+    try srv.handleRetireForTest(victim, 200);
+    try std.testing.expect(srv.localCids.items[1].retired);
+    try std.testing.expect(!srv.cidsIssued); // a refill is pending
+
+    // The refill keeps the active count at the limit. The retired
+    // record stays in the list, marked, so a second retirement of
+    // the same sequence is still detectable.
+    try srv.issueConnectionIds(300);
+    try std.testing.expectEqual(@as(usize, 4), srv.localCids.items.len);
+    var active: usize = 0;
+    for (srv.localCids.items) |c| {
+        if (!c.retired) active += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), active);
+
+    // A sequence we never issued is a protocol violation, not a no-op.
+    try std.testing.expectError(Error.ProtocolViolation, srv.handleRetireForTest(9999, 400));
 }
