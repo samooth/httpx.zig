@@ -136,7 +136,25 @@ pub fn decode(data: []const u8) Error!Params {
             else => {},
         }
 
+        // An unknown parameter must be ignored, and RFC 9000 18.2 puts no
+        // constraint on its length: it can carry a structured value of any
+        // size, not just a power-of-two integer. Decoding one as an integer
+        // made us reject the whole connection -- aioquic sends 0x11
+        // (version_information, 12 bytes) and we answered HandshakeFailed, so
+        // any peer using a QUIC extension could not talk to this server at all.
+        // Skip the value instead of interpreting it.
+        const known = switch (id) {
+            .originalDestinationConnectionId, .initialSourceConnectionId, .retrySourceConnectionId, .statelessResetToken, .maxIdleTimeout, .maxUdpPayloadSize, .initialMaxData, .initialMaxStreamDataBidiLocal, .initialMaxStreamDataBidiRemote, .initialMaxStreamDataUni, .initialMaxStreamsBidi, .initialMaxStreamsUni, .ackDelayExponent, .maxAckDelay, .activeConnectionIdLimit, .disableActiveMigration => true,
+            else => false,
+        };
+        if (!known) {
+            pos += len;
+            continue;
+        }
+
         const valueBe: u64 = switch (id) {
+            // Length-validated above and carried by `parseCidParams`; there is
+            // no numeric value to read.
             .originalDestinationConnectionId, .initialSourceConnectionId, .retrySourceConnectionId, .statelessResetToken => 0,
             else => switch (len) {
                 0 => 0,
@@ -305,5 +323,74 @@ test "validation bounds reject hostile values" {
         const bad = try mk.enc(@intFromEnum(ParamId.activeConnectionIdLimit), 1);
         defer std.testing.allocator.free(bad);
         try std.testing.expectError(Error.InvalidParameter, decode(bad));
+    }
+}
+
+test "unknown parameters are ignored whatever their length" {
+    // RFC 9000 18.2: a receiver MUST ignore parameters it does not know, and
+    // puts no restriction on their length. aioquic sends 0x11
+    // (version_information) as a 12-byte structured value, and the old code
+    // decoded it as an integer, rejected the 12-byte length, and killed the
+    // whole handshake -- so no peer using any QUIC extension could connect.
+    const a = std.testing.allocator;
+
+    // QUIC varints: a 1-byte id is 0x00..0x3F (prefix 00). We know
+    // 0x00-0x0C, 0x0E, 0x0F and 0x10, so 0x0D and 0x11-0x3F are unknown to us.
+    const cases = [_][]const u8{
+        // 0x11 version_information, 12 bytes: what aioquic actually sends.
+        &[_]u8{ 0x11, 0x0C, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 },
+        // Same id, 3 bytes.
+        &[_]u8{ 0x11, 0x03, 0xDE, 0xAD, 0xBE },
+        // 0x0D max_datagram_frame_size (RFC 9221), not implemented here.
+        &[_]u8{ 0x0D, 0x07, 1, 2, 3, 4, 5, 6, 7 },
+        // Unknown id, zero-length value.
+        &[_]u8{ 0x3F, 0x00 },
+        // Unknown id, 5 bytes: a length we would never read as an integer.
+        &[_]u8{ 0x1F, 0x05, 1, 2, 3, 4, 5 },
+        // Unknown 2-byte-varint id (0x412C = 300), 1 byte of value.
+        &[_]u8{ 0x41, 0x2C, 0x01, 0xAA },
+    };
+    for (cases) |case| {
+        // Must not error, and must not be mistaken for a known parameter.
+        const p = try decode(case);
+        try std.testing.expectEqual(Params{}, p);
+    }
+
+    // Mixed with a known one: the known value still lands, the unknown is
+    // stepped over rather than aborting the parse.
+    var mixed = std.ArrayList(u8).empty;
+    defer mixed.deinit(a);
+    var vb: [8]u8 = undefined;
+    std.mem.writeInt(u64, &vb, 1 << 20, .big);
+    try putParam(&mixed, a, @intFromEnum(ParamId.initialMaxData), vb[0..8]);
+    try mixed.appendSlice(a, &[_]u8{ 0x11, 0x0C, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 });
+    // ...and another unknown after it, so a skip that mis-advances `pos`
+    // would desynchronise and fail here.
+    try putParam(&mixed, a, 0x11, &[_]u8{ 9, 8, 7 });
+
+    const p2 = try decode(mixed.items);
+    try std.testing.expectEqual(@as(u64, 1 << 20), p2.initialMaxData);
+
+    // Skipping the unknown ones must not have loosened the known ones: a
+    // malformed known parameter is still a protocol error.
+    {
+        var bad = std.ArrayList(u8).empty;
+        defer bad.deinit(a);
+        try putParam(&bad, a, @intFromEnum(ParamId.ackDelayExponent), &[_]u8{ 1, 2, 3, 4, 5, 6, 7 });
+        try std.testing.expectError(Error.InvalidParameter, decode(bad.items));
+    }
+    {
+        var bad2 = std.ArrayList(u8).empty;
+        defer bad2.deinit(a);
+        try putParam(&bad2, a, @intFromEnum(ParamId.statelessResetToken), &[_]u8{ 1, 2, 3 });
+        try std.testing.expectError(Error.InvalidParameter, decode(bad2.items));
+    }
+    {
+        // Duplicate known parameters are still rejected.
+        var dup = std.ArrayList(u8).empty;
+        defer dup.deinit(a);
+        try putParam(&dup, a, @intFromEnum(ParamId.initialMaxData), vb[0..8]);
+        try putParam(&dup, a, @intFromEnum(ParamId.initialMaxData), vb[0..8]);
+        try std.testing.expectError(Error.DuplicateParameter, decode(dup.items));
     }
 }
