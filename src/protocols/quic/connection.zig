@@ -161,6 +161,10 @@ pub const MAX_DATAGRAM = 1500;
 pub const MAX_PEER_CONNECTION_IDS = 16;
 const MAX_CRYPTO_SEGMENTS = 1024;
 
+/// Floor on how often a PMTU probe may be sent. RFC 9000 ties probing to
+/// the PTO; a fixed interval keeps this state machine trivial.
+const PROBE_INTERVAL_MS = 300;
+
 pub const CidEntry = struct {
     sequence: u64,
     cid: [20]u8 = undefined,
@@ -178,6 +182,9 @@ pub const QueuedControl = struct {
 
 pub const Connection = struct {
     allocator: Allocator,
+    /// Kept for path validation: probing needs fresh unpredictable data
+    /// per PATH_CHALLENGE (RFC 9000 section 8.2.1).
+    io: std.Io,
     role: Role,
     /// QUIC version of the packet that established this connection.
     /// Determines which initial salt applies (RFC 9001 5.2, RFC 9369).
@@ -261,6 +268,17 @@ pub const Connection = struct {
     // Transport parameters (peer's).
     peerParams: ?paramsMod.Params = null,
 
+    // Path MTU discovery (RFC 9000 section 14). `pathMtu` is the largest
+    // UDP payload we believe the current path carries; probes raise it.
+    // It never drops below what we advertise in our own
+    // max_udp_payload_size, because agreeing on that value is the point
+    // of the parameter and the path already carries it both ways.
+    pathMtu: usize = 1472,
+    probeData: [8]u8 = @splat(0),
+    probeTarget: usize = 0,
+    probeOutstanding: bool = false,
+    probeSentMs: u64 = 0,
+
     // CRYPTO reassembly per space (offset -> contiguous).
     cryptoBuf: [3]std.ArrayList(u8) = undefined,
     cryptoRecvOff: [3]u64 = .{ 0, 0, 0 },
@@ -290,6 +308,7 @@ pub const Connection = struct {
         const self = try allocator.create(Connection);
         self.* = .{
             .allocator = allocator,
+            .io = io,
             .role = role,
             .cfg = cfg,
         };
@@ -594,6 +613,13 @@ pub const Connection = struct {
         // control traffic always flows so recovery can never deadlock).
         // The +128 covers header/tag/queued-control slack.
         if (self.bytesInFlight + data.len + 128 > self.cc.bytesInFlightLimit()) return Error.SendBlocked;
+        // A datagram may not exceed what the peer said it can receive or what
+        // the path is known to carry (RFC 9000 section 14). A write larger
+        // than that must be split by the caller; reporting SendBlocked puts
+        // it on the same retry path the congestion gate already uses,
+        // instead of emitting a datagram the peer is entitled to drop.
+        const budget = self.maxSendDatagram();
+        if (data.len > budget) return Error.SendBlocked;
         const oldEnd = self.sendStreamEnd.get(sid) orelse 0;
         if (end > oldEnd) {
             self.dataSent +|= end - oldEnd;
@@ -942,6 +968,10 @@ pub const Connection = struct {
             .closing, .draining, .closed => return,
             else => {},
         }
+        // Probing needs 1-RTT keys and a peer whose limits we know.
+        if (self.state == .established and self.spaces[2].keysTx != null and self.peerParams != null) {
+            self.maybeProbePath(nowMs) catch {};
+        }
         for (&self.spaces, 0..) |*sp, idx| {
             if (sp.lossTimeMs) |lt| {
                 if (nowMs >= lt and sp.sent.items.len > 0) {
@@ -1012,6 +1042,80 @@ pub const Connection = struct {
         self.outbuf.appendSlice(self.allocator, buf[0..n]) catch return;
     }
 
+    /// Largest UDP payload we may put on the wire right now.
+    ///
+    /// RFC 9000 section 14 caps us at the peer's max_udp_payload_size and at
+    /// the path MTU we have established, whichever is smaller. The peer's
+    /// value used to be ignored entirely, so a peer advertising the
+    /// 1200-byte minimum would still have had 1500-byte datagrams sent at
+    /// it -- which it may drop, and which will not survive a path that size.
+    pub fn maxSendDatagram(self: *const Connection) usize {
+        return @min(self.maxSendDatagramCeiling(), self.pathMtu);
+    }
+
+    /// Upper bound on a datagram: the peer's advertised maximum and our own
+    /// receive buffer, ignoring the MTU we are still trying to raise
+    /// (otherwise a probe could never target more than we already believe).
+    fn maxSendDatagramCeiling(self: *const Connection) usize {
+        const peer_max: usize = if (self.peerParams) |p|
+            @min(@as(usize, @intCast(p.maxUdpPayloadSize)), MAX_DATAGRAM)
+        else
+            MAX_DATAGRAM;
+        return peer_max;
+    }
+
+    /// Accepts a PATH_RESPONSE against the outstanding probe. Split out so
+    /// the acceptance rule can be tested without driving a full packet
+    /// through the receive path.
+    fn handlePathResponseForTest(self: *Connection, data: [8]u8) Error!void {
+        if (!self.probeOutstanding) return;
+        if (!std.mem.eql(u8, &data, &self.probeData)) return;
+        self.probeOutstanding = false;
+        self.pathMtu = @max(self.pathMtu, self.probeTarget);
+        self.probeTarget = @min(self.probeTarget * 2, self.maxSendDatagramCeiling());
+    }
+
+    /// Sends a padded PATH_CHALLENGE to test whether the path carries more
+    /// than `pathMtu` (RFC 9000 section 14.2, step 3). Padding to the target
+    /// is what makes the test meaningful: a small packet would fit
+    /// regardless, so a loss shows up as a missing PATH_RESPONSE.
+    fn maybeProbePath(self: *Connection, nowMs: u64) Error!void {
+        if (self.probeOutstanding) return;
+        if (self.probeTarget == 0) self.probeTarget = @min(self.pathMtu * 2, self.maxSendDatagramCeiling());
+        if (self.probeTarget <= self.pathMtu) return;
+        if (nowMs < self.probeSentMs +| PROBE_INTERVAL_MS) return;
+        self.probeSentMs = nowMs;
+        self.probeOutstanding = true;
+
+        // A predictable challenge would let an off-path attacker answer for
+        // the peer, so a failed read must abort the probe rather than reuse
+        // a stale value.
+        self.io.randomSecure(&self.probeData) catch |e| switch (e) {
+            error.EntropyUnavailable, error.Canceled => return Error.TlsDriverFailed,
+        };
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        frames.encode(&payload, self.allocator, .{ .pathChallenge = .{ .data = self.probeData } }) catch |e| switch (e) {
+            error.OutOfMemory => return Error.OutOfMemory,
+            else => return Error.ProtocolViolation,
+        };
+        // Reserve room for the short header, the packet number, the AEAD tag
+        // and the header-protection sample the minimum packet must allow.
+        const overhead = 1 + self.dcidLen + 4 + 16 + 16;
+        if (self.probeTarget > overhead + payload.items.len) {
+            try payload.appendNTimes(self.allocator, 0x00, self.probeTarget - overhead - payload.items.len);
+        }
+        self.packetize(.application, &payload, nowMs) catch |e| switch (e) {
+            // Probing is best effort: a failure here just means we retry on
+            // a later tick.
+            error.OutOfMemory => return Error.OutOfMemory,
+            else => {
+                self.probeOutstanding = false;
+                return;
+            },
+        };
+    }
+
     fn receiveLong(self: *Connection, dgram: []const u8, nowMs: u64) Error!void {
         const parsed = packetMod.parseLongHeader(dgram) catch |e| switch (e) {
             error.UnsupportedVersion => {
@@ -1043,7 +1147,12 @@ pub const Connection = struct {
         } else (sp.keysRx orelse return Error.TlsDriverFailed);
 
         const pnOffset = parsed.header.pnOffset;
-        if (dgram.len > MAX_DATAGRAM) return Error.ProtocolViolation;
+        // Too large for our buffer: drop it silently. RFC 9000 section 13
+        // forbids closing a connection over a datagram we cannot process,
+        // and doing so turned a peer that overran our advertised
+        // max_udp_payload_size into a dead connection instead of a lost
+        // packet.
+        if (dgram.len > MAX_DATAGRAM) return;
         var work: [MAX_DATAGRAM]u8 = undefined;
         @memcpy(work[0..dgram.len], dgram);
 
@@ -1118,7 +1227,9 @@ pub const Connection = struct {
         var keys = sp.keysRx orelse return Error.TlsDriverFailed;
 
         var work: [MAX_DATAGRAM]u8 = undefined;
-        if (dgram.len > work.len) return Error.ProtocolViolation;
+        // Same rule as the long header path (RFC 9000 section 13): a
+        // datagram we cannot fit is dropped, never fatal.
+        if (dgram.len > work.len) return;
         @memcpy(work[0..dgram.len], dgram);
 
         const pnOffset = 1 + self.scidLen; // peer uses OUR scid as dcid
@@ -1425,8 +1536,15 @@ pub const Connection = struct {
                 .newToken => {
                     // RFC 9000 section 19.7: store token for future address validation.
                 },
-                .pathResponse => {
-                    // Path response received; path validated.
+                .pathResponse => |pr| {
+                    // A response to our own probe is the only evidence that the
+                    // padded packet made it through (RFC 9000 14.2 step 4). An
+                    // unsolicited or stale response proves nothing and is dropped.
+                    if (!self.probeOutstanding) break;
+                    if (!std.mem.eql(u8, &pr.data, &self.probeData)) break;
+                    self.probeOutstanding = false;
+                    self.pathMtu = @max(self.pathMtu, self.probeTarget);
+                    self.probeTarget = @min(self.probeTarget * 2, self.maxSendDatagramCeiling());
                 },
             }
         }
@@ -2906,4 +3024,97 @@ test "an unknown version is answered with version negotiation" {
     }
     try std.testing.expect(saw_v1);
     try std.testing.expect(saw_v2);
+}
+
+test "sends are capped by the peer's advertised max_udp_payload_size" {
+    const a = std.testing.allocator;
+    var cli = try Connection.init(a, std.Io.Threaded.global_single_threaded.io(), .client, .{});
+    defer cli.deinit();
+
+    // With no peer params the path MTU we assume is the limit, not our
+    // buffer: we do not put 1500 bytes on a path we have not measured.
+    try std.testing.expect(cli.peerParams == null);
+    try std.testing.expectEqual(@as(usize, 1472), cli.maxSendDatagram());
+    try std.testing.expect(cli.maxSendDatagram() < MAX_DATAGRAM);
+
+    // A peer advertising the 1200-byte minimum must never see more, even
+    // though our buffer would happily carry 1500.
+    cli.peerParams = paramsMod.Params{ .maxUdpPayloadSize = 1200 };
+    try std.testing.expectEqual(@as(usize, 1200), cli.maxSendDatagram());
+
+    // Below the floor we believe for the path, so the peer wins.
+    cli.peerParams = paramsMod.Params{ .maxUdpPayloadSize = 65527 };
+    try std.testing.expectEqual(cli.pathMtu, cli.maxSendDatagram());
+}
+
+test "a write larger than one datagram is reported as blocked, not oversized" {
+    const a = std.testing.allocator;
+    var cli = try Connection.init(a, std.Io.Threaded.global_single_threaded.io(), .client, .{});
+    defer cli.deinit();
+    try cli.installKeys(.application, @splat(0xA1), @splat(0xB2));
+    cli.peerParams = paramsMod.Params{ .maxUdpPayloadSize = 1200 };
+    cli.state = .established;
+
+    const big = [_]u8{0x5A} ** 1400;
+    // Larger than the peer accepts: the caller has to split it, which is the
+    // same retry path a full congestion window already uses.
+    try std.testing.expectError(
+        Error.SendBlocked,
+        cli.sendStreamChecked(0, 0, &big, false, 100),
+    );
+
+    // Within budget it goes through, and the offset advances.
+    const fits: []const u8 = big[0..1000][0..];
+    try cli.sendStreamChecked(0, 0, fits, false, 100);
+    try std.testing.expectEqual(@as(u64, 1000), cli.sendStreamEnd.get(0).?);
+}
+
+test "a PATH_RESPONSE to our probe raises the path mtu, a stale one does not" {
+    const a = std.testing.allocator;
+    var cli = try Connection.init(a, std.Io.Threaded.global_single_threaded.io(), .client, .{});
+    defer cli.deinit();
+    try cli.installKeys(.application, @splat(0xA1), @splat(0xB2));
+    // A peer willing to take 1500, while we start assuming 1472.
+    cli.peerParams = paramsMod.Params{ .maxUdpPayloadSize = 1500 };
+    try std.testing.expectEqual(@as(usize, 1472), cli.maxSendDatagram());
+
+    // Without a probe in flight there is nothing to accept.
+    cli.probeOutstanding = false;
+    cli.probeTarget = 1500;
+    cli.probeData = @splat(0x11);
+    try cli.handlePathResponseForTest(@splat(0x11));
+    try std.testing.expectEqual(@as(usize, 1472), cli.pathMtu);
+
+    // Probe in flight, response for other data: still no change.
+    cli.probeOutstanding = true;
+    cli.probeData = @splat(0x22);
+    try cli.handlePathResponseForTest(@splat(0x33));
+    try std.testing.expectEqual(@as(usize, 1472), cli.pathMtu);
+    try std.testing.expect(cli.probeOutstanding);
+
+    // The matching response is the proof we were waiting for.
+    try cli.handlePathResponseForTest(@splat(0x22));
+    try std.testing.expectEqual(@as(usize, 1500), cli.pathMtu);
+    try std.testing.expect(!cli.probeOutstanding);
+    try std.testing.expectEqual(@as(usize, 1500), cli.maxSendDatagram());
+}
+
+test "an oversized datagram is dropped without killing the connection" {
+    const a = std.testing.allocator;
+    var cli = try Connection.init(a, std.Io.Threaded.global_single_threaded.io(), .client, .{});
+    defer cli.deinit();
+    try cli.installKeys(.application, @splat(0xA1), @splat(0xB2));
+    cli.state = .established;
+
+    // Bigger than the receive buffer. RFC 9000 section 13: a packet we
+    // cannot process is discarded, never a reason to close.
+    var huge: [MAX_DATAGRAM + 64]u8 = @splat(0xC0);
+    huge[0] = 0x40; // looks like a short header
+    cli.receiveDatagram(&huge, 100) catch |e| switch (e) {
+        error.ProtocolViolation, error.AuthenticationFailed => {
+            return error.ConnectionKilledByOversizedPacket;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(State.established, cli.state);
 }
