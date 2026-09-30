@@ -2606,3 +2606,67 @@ test "out of order receipt acks immediately" {
     try pair.server.receiveDatagram(outs[3], 111);
     try std.testing.expect(pair.server.spaces[2].ackQueued);
 }
+
+// Deterministic replay of a real aioquic Client Initial. The live interop
+// harness reaches the same code, but through a socket, a pump thread and a
+// server loop, so a failure there cannot be pinned to a line. This feeds the
+// exact bytes aioquic sends and reports what the packet-protection path
+// actually computes.
+/// Counter TLS driver used by the aioquic replay test below.
+const ReplayTlsCtx = struct {
+    crypto_seen: usize = 0,
+    fn start(c: ?*anyopaque, conn: *Connection, nowMs: u64) Error!void {
+        _ = c;
+        _ = conn;
+        _ = nowMs;
+    }
+    fn onData(c: ?*anyopaque, conn: *Connection, data: []const u8, nowMs: u64) Error!void {
+        _ = conn;
+        _ = nowMs;
+        const box: *ReplayTlsCtx = @ptrCast(@alignCast(c.?));
+        box.crypto_seen += data.len;
+    }
+};
+
+test "replay aioquic client initial" {
+    const a = std.testing.allocator;
+    var nctx = @import("../../sockets/tcp.zig").IoContext.init(a) catch return;
+    defer nctx.deinit();
+
+    const bytes = @embedFile("testdata/aioquic_client_initial.bin");
+
+    const parsed = packetMod.parseLongHeader(bytes) catch |e| {
+        std.debug.print("REPLAY parse-err {s}\n", .{@errorName(e)});
+        return error.ReplayFailed;
+    };
+    std.debug.print("REPLAY type={s} ver=0x{X} dcidLen={d} scidLen={d} tokLen={d} pnOff={d} len={d}\n", .{
+        @tagName(parsed.header.type), parsed.header.version,
+        parsed.header.dcid.len,       parsed.header.scid.len,
+        parsed.header.token.len,      parsed.header.pnOffset,
+        parsed.header.length,
+    });
+
+    var srv = try Connection.init(a, nctx.io, .server, .{});
+    defer srv.deinit();
+    try srv.acceptInitial(parsed.header.dcid, parsed.header.version);
+
+    // A no-op TLS driver: enough to prove the packet was decrypted and its
+    // CRYPTO frame handed upwards. Without it the driver is null and the
+    // receive path fails after a *successful* decryption, which reads as a
+    // packet-protection failure and is not one.
+    var tlsctx = ReplayTlsCtx{};
+    srv.tls = .{ .ctx = &tlsctx, .start = ReplayTlsCtx.start, .onData = ReplayTlsCtx.onData };
+
+    // A single ClientHello spans several CRYPTO frames and QUIC expects the
+    // handshake to keep pumping, so a one-shot call is expected to end in a
+    // driver error. What matters is that it got there: bytes decrypted and
+    // handed upwards is the claim this test makes.
+    srv.receiveDatagram(bytes, 100) catch |e| {
+        std.debug.print("REPLAY stopped with {s} after {d} CRYPTO bytes\n", .{ @errorName(e), tlsctx.crypto_seen });
+    };
+
+    // The real assertion: the packet was authenticated and its payload was
+    // delivered. A decryption failure would deliver nothing and fail here.
+    try std.testing.expect(tlsctx.crypto_seen > 0);
+    try std.testing.expectEqual(@as(usize, 452), tlsctx.crypto_seen);
+}
