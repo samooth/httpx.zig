@@ -165,6 +165,37 @@ pub const BuildInfo = struct {
 /// Writes the long header up to (not including) the packet number.
 /// Returns the number of header bytes written; the caller appends
 /// pnLen packet-number bytes then the protected payload.
+/// Builds a Version Negotiation packet (RFC 9000 section 17.2.1).
+///
+/// The fixed bit is 0 and the version field is 0; the connection IDs are
+/// echoed back swapped, and the body is every version this endpoint speaks.
+/// Sent in response to a long header carrying a version we do not know,
+/// which is the whole reason the packet exists: without it a peer whose
+/// preferred version is unsupported gets silence instead of a negotiation
+/// it can act on.
+pub fn writeVersionNegotiation(buf: []u8, dcid: []const u8, scid: []const u8) HeaderError!usize {
+    if (dcid.len > 20 or scid.len > 20) return HeaderError.TooLarge;
+    var pos: usize = 0;
+    buf[pos] = 0x80; // long header, fixed bit 0
+    pos += 1;
+    @memcpy(buf[pos..][0..4], &[_]u8{ 0, 0, 0, 0 }); // version 0
+    pos += 4;
+    buf[pos] = @intCast(dcid.len);
+    pos += 1;
+    @memcpy(buf[pos..][0..dcid.len], dcid);
+    pos += dcid.len;
+    buf[pos] = @intCast(scid.len);
+    pos += 1;
+    @memcpy(buf[pos..][0..scid.len], scid);
+    pos += scid.len;
+    for ([_]u32{ @intFromEnum(Version.version1), @intFromEnum(Version.version2) }) |v| {
+        if (pos + 4 > buf.len) return HeaderError.BufferTooSmall;
+        std.mem.writeInt(u32, buf[pos..][0..4], v, .big);
+        pos += 4;
+    }
+    return pos;
+}
+
 pub fn writeLongHeader(buf: []u8, info: BuildInfo) HeaderError!usize {
     if (info.dcid.len > 20 or info.scid.len > 20) return HeaderError.InvalidPacket;
     if (info.pnLen == 0 or info.pnLen > 4) return HeaderError.InvalidPacket;
@@ -308,4 +339,32 @@ test "truncated headers rejected cleanly at every cut" {
             parseLongHeader(buf[0..cut]),
         );
     }
+}
+
+test "version negotiation packet echoes ids and lists our versions" {
+    const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
+    const scid = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
+    var buf: [128]u8 = undefined;
+
+    const n = try writeVersionNegotiation(&buf, &dcid, &scid);
+
+    // Fixed bit 0, version field 0, then the ids back the other way round.
+    try std.testing.expectEqual(@as(u8, 0x80), buf[0]);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0 }, buf[1..5]);
+    try std.testing.expectEqual(@as(u8, dcid.len), buf[5]);
+    try std.testing.expectEqualSlices(u8, &dcid, buf[6..10]);
+    try std.testing.expectEqual(@as(u8, scid.len), buf[10]);
+    try std.testing.expectEqualSlices(u8, &scid, buf[11..17]);
+
+    // The body is every version we speak, so a peer can pick one.
+    const versions = n - 17;
+    try std.testing.expectEqual(@as(usize, 8), versions);
+    try std.testing.expectEqual(
+        @as(u32, @intFromEnum(Version.version1)),
+        std.mem.readInt(u32, buf[17..21], .big),
+    );
+    try std.testing.expectEqual(
+        @as(u32, @intFromEnum(Version.version2)),
+        std.mem.readInt(u32, buf[21..25], .big),
+    );
 }

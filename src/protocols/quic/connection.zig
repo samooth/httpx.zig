@@ -989,9 +989,39 @@ pub const Connection = struct {
         }
     }
 
+    /// Queues a Version Negotiation reply for the datagram just received.
+    ///
+    /// The connection IDs are echoed back swapped, which is how the peer
+    /// tells the reply belongs to its own connection. Appended straight to
+    /// the output buffer: a VN carries no frames and must go out even when
+    /// the connection has nothing else to send.
+    fn sendVersionNegotiation(self: *Connection, dgram: []const u8) void {
+        if (dgram.len < 6) return;
+        const dcid_len = dgram[5];
+        const scid_off = 6 + dcid_len;
+        if (scid_off >= dgram.len) return;
+        const scid_len = dgram[scid_off];
+        const scid_start = scid_off + 1;
+        if (scid_start + scid_len > dgram.len) return;
+        var buf: [128]u8 = undefined;
+        const n = packetMod.writeVersionNegotiation(
+            &buf,
+            dgram[scid_start..][0..scid_len],
+            dgram[6..][0..dcid_len],
+        ) catch return;
+        self.outbuf.appendSlice(self.allocator, buf[0..n]) catch return;
+    }
+
     fn receiveLong(self: *Connection, dgram: []const u8, nowMs: u64) Error!void {
         const parsed = packetMod.parseLongHeader(dgram) catch |e| switch (e) {
-            error.UnsupportedVersion => return, // ignore unknown versions
+            error.UnsupportedVersion => {
+                // Answer with our supported set. Ignoring the packet is what this
+                // used to do, leaving a peer that offers only a version we do not
+                // speak with no reply at all, where RFC 9000 6 requires a
+                // negotiation it can act on.
+                if (dgram.len >= 6) self.sendVersionNegotiation(dgram);
+                return;
+            },
             else => return Error.ProtocolViolation,
         };
 
@@ -2824,4 +2854,56 @@ test "a reordered packet from the previous key phase still decrypts" {
         error.AuthenticationFailed => return error.ReorderedPacketRejected,
         else => {},
     };
+}
+
+test "an unknown version is answered with version negotiation" {
+    const a = std.testing.allocator;
+    var ctx = @import("../../sockets/tcp.zig").IoContext.init(a) catch return;
+    defer ctx.deinit();
+
+    var srv = try Connection.init(a, ctx.io, .server, .{});
+    defer srv.deinit();
+
+    // A long header with a version we do not speak. Layout mirrors a real
+    // Initial: flag, version, dcid len, dcid, scid len, scid.
+    const dcid = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const scid = [_]u8{ 9, 9, 9, 9, 9, 9, 9, 9 };
+    var dgram: [64]u8 = undefined;
+    dgram[0] = 0xC0;
+    std.mem.writeInt(u32, dgram[1..5], 0x1A2A3A4A, .big); // unknown version
+    dgram[5] = dcid.len;
+    @memcpy(dgram[6..14], &dcid);
+    dgram[14] = scid.len;
+    @memcpy(dgram[15..23], &scid);
+
+    // Ignored before, silently: the peer got nothing back at all.
+    srv.receiveDatagram(dgram[0..23], 100) catch |e| switch (e) {
+        error.ProtocolViolation => return error.UnexpectedRejection,
+        else => {},
+    };
+
+    const out = srv.takeOutput(a) catch return;
+    defer a.free(out);
+    try std.testing.expect(out.len > 0);
+
+    // What comes back is a VN naming the versions we speak, with the ids
+    // swapped so the peer recognises the reply.
+    try std.testing.expectEqual(@as(u8, 0x80), out[0]);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0 }, out[1..5]);
+    try std.testing.expectEqual(@as(u8, scid.len), out[5]);
+    try std.testing.expectEqualSlices(u8, &scid, out[6..14]);
+
+    // And the versions are ones the client can actually use.
+    var saw_v1 = false;
+    var saw_v2 = false;
+    var pos: usize = 6 + scid.len;
+    const dlen = out[pos];
+    pos += 1 + dlen;
+    while (pos + 4 <= out.len) : (pos += 4) {
+        const v = std.mem.readInt(u32, out[pos..][0..4], .big);
+        if (v == @intFromEnum(packetMod.Version.version1)) saw_v1 = true;
+        if (v == @intFromEnum(packetMod.Version.version2)) saw_v2 = true;
+    }
+    try std.testing.expect(saw_v1);
+    try std.testing.expect(saw_v2);
 }
