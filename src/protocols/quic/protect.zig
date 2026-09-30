@@ -6,6 +6,8 @@
 //! primitives directly. Vectors come from RFC 9001 Appendix A.
 
 const std = @import("std");
+const crypto = @import("crypto.zig");
+const MAX_DATAGRAM = 1500;
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 const Aes = std.crypto.core.aes;
 
@@ -187,6 +189,24 @@ pub fn sealWithKeys(
 }
 
 /// Decrypts using ProtectionKeys.
+/// Opens a packet, reporting success as a bool.
+///
+/// Same as `openWithKeys`, for the key-phase probe: trying a candidate key
+/// set is an ordinary outcome, not an error to propagate.
+pub fn tryOpen(
+    out: []u8,
+    ciphertext: []const u8,
+    tag: [16]u8,
+    aad: []const u8,
+    keys: crypto.ProtectionKeys,
+    pn: u64,
+) bool {
+    var scratch: [MAX_DATAGRAM]u8 = undefined;
+    const dest = if (out.len <= scratch.len) out else scratch[0..out.len];
+    openWithKeys(dest, ciphertext, tag, aad, keys, pn) catch return false;
+    return true;
+}
+
 pub fn openWithKeys(
     plaintextOut: []u8,
     ciphertext: []const u8,

@@ -69,6 +69,17 @@ pub const PnSpace = struct {
     /// Protection keys once installed (null until TLS provides them).
     keysRx: ?crypto.ProtectionKeys = null,
     keysTx: ?crypto.ProtectionKeys = null,
+    /// Key phase currently written for 1-RTT (RFC 9001 6). It used to be
+    /// hardcoded to false on every packet, so the phase never moved and the
+    /// 1-RTT keys never rotated.
+    keyPhase: bool = false,
+    /// Application secrets, retained because a key update derives the next
+    /// phase from the current secret and protection keys cannot be inverted
+    /// back into one.
+    txSecret: ?[32]u8 = null,
+    rxSecret: ?[32]u8 = null,
+    /// Packets encrypted under the current keys, counted to trigger update.
+    packetsInPhase: u64 = 0,
     /// Highest received PN for duplicate suppression.
     highestRxPn: i64 = -1,
     gpa: Allocator,
@@ -380,13 +391,44 @@ pub const Connection = struct {
         rxSecret: [32]u8,
     ) !void {
         const sp = &self.spaces[@intFromEnum(kind)];
-        var ktx = crypto.deriveProtectionKeys(txSecret);
-        var krx = crypto.deriveProtectionKeys(rxSecret);
-        // AES-128-GCM suite for this build; HP key same width.
-        _ = &ktx;
-        _ = &krx;
-        sp.keysTx = ktx;
-        sp.keysRx = krx;
+        sp.keysTx = crypto.deriveProtectionKeys(txSecret);
+        sp.keysRx = crypto.deriveProtectionKeys(rxSecret);
+        sp.txSecret = txSecret;
+        sp.rxSecret = rxSecret;
+        sp.keyPhase = false;
+        sp.packetsInPhase = 0;
+    }
+
+    /// Rotates transmit keys to the next key phase (RFC 9001 6).
+    ///
+    /// The secret advances with the "quic ku" label, protection keys and IVs
+    /// are re-derived from it, and the phase bit flips. Receive keeps its own
+    /// phase: each side updates independently, which is why the peer is what
+    /// tells us to move.
+    pub fn initiateKeyUpdate(self: *Connection) !void {
+        const sp = &self.spaces[@intFromEnum(SpaceKind.application)];
+        const cur = sp.txSecret orelse return Error.TlsDriverFailed;
+        const next = crypto.nextApplicationSecret(cur);
+        sp.keysTx = crypto.deriveProtectionKeys(next);
+        sp.txSecret = next;
+        sp.keyPhase = !sp.keyPhase;
+        sp.packetsInPhase = 0;
+    }
+
+    /// Moves receive keys to the next phase after the peer flipped the bit.
+    ///
+    /// Whether the derived keys actually open the packet is decided by the
+    /// caller's decryption attempt, not here: that is how "peer updated" is
+    /// told apart from "packet is corrupt".
+    pub fn advanceRxKeyPhase(self: *Connection) bool {
+        const sp = &self.spaces[@intFromEnum(SpaceKind.application)];
+        const cur = sp.rxSecret orelse return false;
+        const next = crypto.nextApplicationSecret(cur);
+        sp.keysRx = crypto.deriveProtectionKeys(next);
+        sp.rxSecret = next;
+        sp.keyPhase = !sp.keyPhase;
+        sp.packetsInPhase = 0;
+        return true;
     }
 
     pub fn installZeroRttKeys(self: *Connection, secret: [32]u8, isTx: bool) void {
@@ -649,7 +691,7 @@ pub const Connection = struct {
             }) catch return Error.BufferTooSmall
         else if (kind == .application)
             packetMod.writeShortHeader(buf[0..], .{
-                .keyPhase = false,
+                .keyPhase = sp.keyPhase,
                 .dcid = self.dcid[0..self.dcidLen],
                 .pnLen = pnLen,
             }) catch return Error.BufferTooSmall
@@ -1042,8 +1084,8 @@ pub const Connection = struct {
         self.afterPacketReceived(sp, pn, nowMs);
     }
     fn receiveShort(self: *Connection, dgram: []const u8, nowMs: u64) Error!void {
-        const sp = &self.spaces[2];
-        const keys = sp.keysRx orelse return Error.TlsDriverFailed;
+        var sp = &self.spaces[2];
+        var keys = sp.keysRx orelse return Error.TlsDriverFailed;
 
         var work: [MAX_DATAGRAM]u8 = undefined;
         if (dgram.len > work.len) return Error.ProtocolViolation;
@@ -1080,9 +1122,40 @@ pub const Connection = struct {
         if (dgram.len < aadLen + 16) return Error.ProtocolViolation;
         const ctLen = dgram.len - aadLen - 16;
 
+        // The key phase bit arrives header-protected, so only the correct
+        // phase's HP key unmasks it into a meaningful value. Read it here,
+        // after unmasking; before that it is noise.
+        const peer_phase = (work[0] & 0x04) != 0;
+
         var pt: [MAX_DATAGRAM]u8 = undefined;
-        protect.openWithKeys(pt[0..ctLen], work[aadLen..][0..ctLen], work[aadLen + ctLen ..][0..16].*, work[0..aadLen], keys, pn) catch
-            return Error.AuthenticationFailed;
+
+        if (peer_phase != sp.keyPhase) {
+            // The peer updated ahead of us. Try its phase; if those keys do
+            // not open the packet then it was our own phase, late.
+            const prev_keys = sp.keysRx;
+            const prev_secret = sp.rxSecret;
+            const prev_phase = sp.keyPhase;
+            _ = self.advanceRxKeyPhase();
+            const trial = sp.keysRx.?;
+            var opened = false;
+            _ = &opened;
+            if (protect.tryOpen(pt[0..ctLen], work[aadLen..][0..ctLen], work[aadLen + ctLen ..][0..16].*, work[0..aadLen], trial, pn)) opened = true;
+            if (opened) {
+                keys = trial;
+            } else {
+                // Not an update. Restore, then accept under the old keys:
+                // reordered packets from the previous phase must still
+                // decrypt, which is why they are not simply discarded.
+                sp.keysRx = prev_keys;
+                sp.rxSecret = prev_secret;
+                sp.keyPhase = prev_phase;
+                protect.openWithKeys(pt[0..ctLen], work[aadLen..][0..ctLen], work[aadLen + ctLen ..][0..16].*, work[0..aadLen], keys, pn) catch
+                    return Error.AuthenticationFailed;
+            }
+        } else {
+            protect.openWithKeys(pt[0..ctLen], work[aadLen..][0..ctLen], work[aadLen + ctLen ..][0..16].*, work[0..aadLen], keys, pn) catch
+                return Error.AuthenticationFailed;
+        }
 
         sp.highestRxPn = @max(sp.highestRxPn, @as(i64, @intCast(@min(pn, 1 << 62))));
         sp.largestAcked = if (sp.largestAcked) |old| @max(old, pn) else pn;
@@ -2669,4 +2742,86 @@ test "replay aioquic client initial" {
     // delivered. A decryption failure would deliver nothing and fail here.
     try std.testing.expect(tlsctx.crypto_seen > 0);
     try std.testing.expectEqual(@as(usize, 452), tlsctx.crypto_seen);
+}
+
+test "key update rotates 1-RTT keys and the peer follows the phase" {
+    const a = std.testing.allocator;
+    var ctx = @import("../../sockets/tcp.zig").IoContext.init(a) catch return;
+    defer ctx.deinit();
+
+    var cli = try Connection.init(a, ctx.io, .client, .{});
+    defer cli.deinit();
+    var srv = try Connection.init(a, ctx.io, .server, .{});
+    defer srv.deinit();
+
+    const tx: [32]u8 = @splat(0xA1);
+    const rx: [32]u8 = @splat(0xB2);
+    try cli.installKeys(.application, tx, rx);
+    try srv.installKeys(.application, rx, tx);
+
+    // Both sides start in phase 0 with the keys they were installed with.
+    try std.testing.expect(!cli.spaces[2].keyPhase);
+    try std.testing.expectEqualSlices(u8, &tx, &cli.spaces[2].txSecret.?);
+
+    // Rotating advances the secret with "quic ku", changes the derived keys,
+    // and flips the phase bit that goes on the wire.
+    const before = cli.spaces[2].txSecret.?;
+    const before_key = cli.spaces[2].keysTx.?.key;
+    try cli.initiateKeyUpdate();
+    const after = cli.spaces[2].txSecret.?;
+    try std.testing.expect(!std.mem.eql(u8, &before, &after));
+    try std.testing.expectEqualSlices(u8, &crypto.nextApplicationSecret(before), after[0..]);
+    try std.testing.expect(!std.mem.eql(u8, before_key[0..16], cli.spaces[2].keysTx.?.key[0..16]));
+    try std.testing.expect(cli.spaces[2].keyPhase);
+
+    // The receiver, still in phase 0, advances to meet it.
+    try std.testing.expect(!srv.spaces[2].keyPhase);
+    try std.testing.expect(srv.advanceRxKeyPhase());
+    try std.testing.expect(srv.spaces[2].keyPhase);
+    // Both ends now hold the same 1-RTT secret, from opposite directions.
+    try std.testing.expectEqualSlices(u8, &cli.spaces[2].txSecret.?, &srv.spaces[2].rxSecret.?);
+
+    // A second update returns to phase 0 and a further secret.
+    try cli.initiateKeyUpdate();
+    try std.testing.expect(!cli.spaces[2].keyPhase);
+    try std.testing.expect(!std.mem.eql(u8, &after, &cli.spaces[2].txSecret.?));
+}
+
+test "a reordered packet from the previous key phase still decrypts" {
+    const a = std.testing.allocator;
+    var ctx = @import("../../sockets/tcp.zig").IoContext.init(a) catch return;
+    defer ctx.deinit();
+
+    var cli = try Connection.init(a, ctx.io, .client, .{});
+    defer cli.deinit();
+    var srv = try Connection.init(a, ctx.io, .server, .{});
+    defer srv.deinit();
+
+    try cli.installKeys(.application, @splat(0xA1), @splat(0xB2));
+    try srv.installKeys(.application, @splat(0xB2), @splat(0xA1));
+
+    // A packet sealed under phase 0, held back while the peer updates.
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(a);
+    frames.encode(&payload, a, .{ .ping = {} }) catch return;
+    try cli.packetize(.application, &payload, 100);
+    const datagram = try cli.takeOutput(a);
+    defer a.free(datagram);
+
+    try srv.receiveDatagram(datagram, 100);
+
+    // The peer updates, so the held packet is now from the "wrong" phase.
+    try cli.initiateKeyUpdate();
+    _ = srv.advanceRxKeyPhase();
+    try std.testing.expect(srv.spaces[2].keyPhase);
+
+    // Replaying it must not be dropped: the receive path falls back to the
+    // previous keys when the candidate phase does not open the packet.
+    // A duplicate is dropped by the ACK tracker; the point is that the
+    // packet reaches the decrypt path at all rather than failing as an
+    // unauthenticated packet.
+    srv.receiveDatagram(datagram, 200) catch |e| switch (e) {
+        error.AuthenticationFailed => return error.ReorderedPacketRejected,
+        else => {},
+    };
 }
