@@ -8,6 +8,10 @@ RFC 9000 defines QUIC, a secure, general-purpose, multiplexed transport protocol
 * **Stream Multiplexing**: Supports arbitrary numbers of concurrent unidirectional and bidirectional streams.
 * **Low Latency Handshake**: 1-RTT connection setup for new connections, and 0-RTT early-data connection resumption with pre-shared keys (PSK) and bounded anti-replay protection.
 * **Congestion Control**: NewReno controller plus RTT/loss detection primitives (`loss.zig`, `cc.zig`); ACK tracking is integrated into the receive path.
+* **Key Update**: 1-RTT keys rotate on the confidentiality limit, and the peer phase is followed. See RFC 9001 section 6.
+* **Path MTU Discovery**: Sends are capped by what the peer advertised, and padded `PATH_CHALLENGE` probes raise the estimate. See RFC 9000 section 14.
+* **Connection Migration**: Connection IDs are issued so a peer can migrate, and a new address is validated before it is used. See RFC 9000 section 9.
+* **Version Negotiation**: An unsupported version is answered rather than dropped. See RFC 9000 section 6.
 * **Retry**: Integrity-tagged Retry packets (`protect.zig`) for address validation.
 
 ## QUIC Packet Types
@@ -17,62 +21,81 @@ RFC 9000 defines QUIC, a secure, general-purpose, multiplexed transport protocol
 * `0-RTT Protected`: Carries early application data for resumed sessions.
 * `1-RTT (Short Header)`: Carries standard application streams with minimum 1-byte header overhead.
 
+## Interoperability
+
+The transport interoperates with aioquic 1.2.0. A client sends a real HTTP/3
+`GET`, this stack completes the QUIC and TLS handshakes, decodes the request,
+answers it, and aioquic receives the response headers and body. The observed
+event sequence is `ProtocolNegotiated`, `HandshakeCompleted`,
+`ConnectionIdIssued`, `StreamDataReceived`, `HeadersReceived`,
+`DataReceived`.
+
+This matters more than the feature list above, because it is what found four
+defects that no unit test could see. Each one was self-consistent: both ends
+of every test are this implementation, so a wrong reading of the RFC agreed
+with itself and passed. They are written up in
+[Interop Status](/reference/interop-status#four-defects-only-a-third-party-stack-could-show).
+
+Two real datagrams from aioquic are checked into
+`src/protocols/quic/testdata/` and replayed by the unit suite with the
+destination connection ID from the same run, so the Initial keys can be
+re-derived and the packets decrypted.
+
+The gap that remains is process rather than behaviour: the live exchange runs
+from an external script, not from the opt-in `HTTPX_INTEROP=1` suite, so it
+does not fail CI on a regression. The replayed captures cover the handshake;
+the request/response exchange does not.
+
 ## What is not implemented
 
 Written down so the gaps are visible rather than discovered. None of these are
 bugs in what is present; they are absent features.
 
-### Version Negotiation (RFC 9000 §6)
+### Acting on a Version Negotiation packet
 
-The transport **rejects** a packet whose version it does not support —
-`Version.isSupported` gates the header parse, and `UnsupportedVersion` is
-surfaced from both `packet.zig` and `crypto.zig`. What is missing is the other
-half: when a peer offers an unknown version, this implementation silently
-ignores the packet rather than responding with a Version Negotiation packet
-listing the versions it does support. `connection.zig:921` notes this
-explicitly:
+The reply half is implemented: `packet.writeVersionNegotiation` builds the
+packet per RFC 9000 section 17.2.1, and `receiveLong` sends it when
+`parseLongHeader` reports `UnsupportedVersion`. An incoming VN is still
+ignored.
 
-```zig
-return; // Version negotiation: policy handled above this layer.
-```
+Acting on one would mean renegotiating a version whose keys have already been
+derived, and the version we offer is always one we speak, so the packet only
+arrives in reply to a version we chose not to offer. Worth finishing only
+alongside real multi-version negotiation on the client.
 
-So the version check exists, the VN *packet* does not. A peer that offers only
-a version we do not speak gets no answer at all, where RFC 9000 requires one.
-This matters in practice for version-rollout interoperability, which is the
-whole point of the mechanism.
+### DPLPMTUD frames and ICMP feedback
 
-### Path MTU Discovery (RFC 9000 §14)
+Path MTU is discovered by probing, not with the dedicated frames: no
+`DPLPMTUD` frame type (RFC 8899) exists in `frames.zig`, and nothing consumes
+ICMP "packet too big" to shorten the estimate. Probes are `PATH_CHALLENGE`
+packets padded to the target size, on a fixed interval rather than one derived
+from the PTO.
 
-No PMTU probing. Nothing in `src/protocols/quic/` searches for `PmtuDiscovery`
-or path-challenge frames, and no DPLPMTUD frame type exists in `frames.zig`.
-The transport uses a configured maximum datagram size and does not grow it.
-Since QUIC is UDP, this means large responses can be black-holed by a path
-that cannot carry them and gives no ICMP signal — the failure QUIC's PMTUD
-specifically exists to avoid.
+### Migration initiated from this side
 
-### Connection Migration (RFC 9000 §9)
+A peer that changes address is handled: the new address is treated as a
+candidate, the validated address stays the send destination, a
+`PATH_CHALLENGE` goes out, and the switch happens once the path is proven.
+What this stack does not do is move its own source address, distinguish NAT
+rebinding (RFC 9000 section 9.3) from a genuine migration, or act on a
+`preferred_address` transport parameter (section 9.6).
 
-`connectionId.zig` manages connection IDs for peer-initiated address changes,
-but the transport does not perform the migration itself: there is no
-`PATH_CHALLENGE`/`PATH_RESPONSE` exchange and no path validation before a new
-address is used. The CID infrastructure that migration would build on is
-present; the mechanism is not.
+`Endpoint` carries one connection, so there is no connection-ID
+demultiplexing on the receive side yet.
 
-### Interoperability is untested against a third-party stack
+`PATH_ABILITY` is not sent, which is correct while zero-length connection IDs
+are not offered.
 
-Every test in `src/protocols/quic/` drives this implementation against itself.
-That catches wire-format and state-machine regressions that stay
-self-consistent, which is most of them — but it cannot catch a reading of the
-RFC that is wrong in the same direction on both ends. No test runs this QUIC
-stack against nghttp3, quiche, or any other QUIC implementation.
+### Stream data coalesced with the last handshake flight
 
-This is the same gap the TLS side closed with real `curl` and `openssl`
-binaries; see [Interop Status](/reference/interop-status) for how that was
-addressed there and why the equivalent is still missing here.
+A client commonly puts its Finished and its first request in one datagram.
+That datagram is processed inside the call that completes the handshake, so
+`onStreamData` fires before a caller that attaches callbacks after
+`serveHandshake` has attached them, and the request is dropped. `Stream`
+retains the bytes, but they are not replayed when a callback appears.
 
-There is no QUIC client on this machine to test against: `curl` here is built
-without HTTP/3 support, and `nghttp3` is not installed. Closing this needs an
-independent implementation, not more unit tests.
+Servers must install `cbs` before driving the handshake. Making this safe
+would mean buffering until a consumer exists.
 
 ## Related
 

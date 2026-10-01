@@ -43,6 +43,46 @@ and LLVM does not reconsider it because the body writes anyway, so
 free loop as provably empty, and fold `defer ctx.deinit()` away. Every node
 pushed during a render leaked. See the `*Context` guard in `renderer.zig`.
 
+### Four defects only a third-party stack could show
+
+The QUIC transport had never been run against an independent implementation.
+Against aioquic 1.2.0 the handshake never completed, and the four causes were
+all invisible to the unit suite for the same reason: both ends of every test
+are this stack, so a wrong reading of the RFC agreed with itself and passed.
+
+Each one was found by comparing bytes rather than by reading code, and each one
+had to be pinned with a test, because none of them was obvious on the second
+look.
+
+| | Defect | Why the suite stayed green |
+|---|---|---|
+| 1 | The server addressed its replies to the Destination CID the client had chosen, instead of the client's own Source CID (RFC 9000 section 7.2) | Both ends implemented the same wrong convention, so the round trip worked |
+| 2 | Datagram padding after the last packet in a datagram was parsed as a short-header packet | Padding is always zero bytes, and this stack's own senders pad identically |
+| 3 | Integer transport parameters were written as eight raw big-endian bytes instead of variable-length integers | The decoder had the matching mistake, so encode and decode agreed |
+| 4 | The AEAD nonce XORed the packet number in native byte order instead of big-endian (RFC 9001 section 5.3) | Both ends derived the nonce the same wrong way |
+
+Defect 4 is the one worth remembering. Packet number 0 XORs nothing, and the
+ClientHello is packet number 0, so the very first packet of every connection
+authenticated correctly and the first ACK -- packet number 1 -- did not. The
+handshake looked healthy right up to the moment the connection stalled.
+
+Isolating it took the ciphertext aioquic actually sent, its destination
+connection ID from the same run, and a comparison against aioquic's own
+decryption. Key, nonce, ciphertext, tag and associated data all matched byte
+for byte, which left only the way they were combined as a candidate. That
+pair of datagrams is now in `src/protocols/quic/testdata/` and replayed by the
+unit suite.
+
+Both receive paths also now check the destination connection ID against the
+IDs we issued (RFC 9000 section 5.3) before touching a key. Without that, a
+wrong addressing convention cannot be observed at all: the packets simply fail
+to decrypt, which looks like a cryptography problem.
+
+What is still missing is process. The live aioquic exchange runs from an
+external script rather than the opt-in suite, so a regression in the
+request/response path would not fail CI. The replayed captures cover the
+handshake; the HTTP/3 exchange does not.
+
 ## Open
 
 ### `h2` advertised through ALPN but not implemented

@@ -6,12 +6,11 @@
 > implemented and integrated into the receive path (`loss.zig`,
 > `cc.zig`); earlier revisions of this page claimed otherwise.
 >
-> Verified over loopback only. Every HTTP/3 test drives this
-> implementation against itself, so no test runs it against an independent
-> QUIC stack. Outside its scope it fails loudly, never silently
-> downgraded. See [Interop Status](/reference/interop-status) for the
-> transport-level gaps and [QUIC](/protocols/quic) for what the transport
-> does not implement.
+> Verified against aioquic 1.2.0: a third-party HTTP/3 client sends a real
+> request and receives the response, including headers and body. Outside its
+> scope it fails loudly, never silently downgraded. See
+> [Interop Status](/reference/interop-status) and
+> [QUIC](/protocols/quic#what-is-not-implemented) for the transport-level gaps.
 
 ## Motivation
 
@@ -25,9 +24,11 @@ While HTTP/2 eliminated head-of-line blocking at the application level, TCP head
   anything relying on push will not work.
 * **HTTP Datagrams** (RFC 9297) are not part of the frame set here.
 
-The transport-level gaps that HTTP/3 inherits -- Version Negotiation, Path MTU
-Discovery, connection migration -- are listed under
-[QUIC](/protocols/quic#what-is-not-implemented).
+The transport implements Version Negotiation, Path MTU Discovery and connection
+migration. What HTTP/3 still inherits from it is listed under
+[QUIC](/protocols/quic#what-is-not-implemented); the item that affects this
+protocol most is that stream data coalesced with the last handshake flight is
+dropped unless a server installs its callbacks before driving the handshake.
 
 ## Architecture Comparison
 
@@ -55,9 +56,9 @@ Discovery, connection migration -- are listed under
 
 Live since the QUIC transport landing: `client.get` with
 `.httpVersion = .http3` performs a real QUIC + TLS 1.3 handshake (ALPN
-`h3`, verified chain) over UDP. Reliable paths (loopback/LAN) — no loss
-recovery yet, so lossy networks stall to the request deadline. Runnable
-end to end in `examples/http3Client.zig`:
+`h3`, verified chain) over UDP. Loss recovery and congestion control apply,
+so lossy paths retransmit rather than stalling to the deadline. Runnable end
+to end in `examples/http3Client.zig`:
 
 ```zig
 const std = @import("std");
