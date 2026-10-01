@@ -103,6 +103,11 @@ jobs:
     #
     # Opt-in via HTTPX_INTEROP so the three-OS matrix above stays hermetic and
     # never depends on these binaries being present.
+    #
+    # curl and openssl cover TLS; aioquic covers QUIC and HTTP/3, where four
+    # wire-format defects hid for as long as the suite only ever talked to
+    # itself. It is a Python package rather than a binary, so it is installed
+    # per job below.
     name: Interop (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -136,6 +141,15 @@ jobs:
 
       - name: OpenSSL capabilities
         run: openssl version && (openssl list -kem-algorithms || true)
+
+      # No runner ships aioquic. The test asks the interpreter whether it
+      # imports and skips if not, so this step is what makes the HTTP/3
+      # interop reachable rather than permanently skipped.
+      - name: Install aioquic
+        shell: bash
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check aioquic
+          python3 -c "import aioquic; print('aioquic', aioquic.__version__)"
 
       - name: Interop tests
         shell: bash
