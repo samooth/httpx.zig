@@ -310,7 +310,7 @@ test "quic endpoints exchange protected initial packets over real udp" {
         }
     };
     try client.sendFrames(.initial, PingC.build, 50);
-    try server.acceptInitial(client.dcid[0..8], 0x00000001);
+    try server.acceptInitial(client.dcid[0..8], client.scid[0..8], 0x00000001);
 
     var ce = try Endpoint.init(a, ctx.io, client, .{});
     defer ce.deinit();

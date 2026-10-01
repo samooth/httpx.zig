@@ -64,8 +64,22 @@ inline fn putV(out: *std.ArrayList(u8), gpa: Allocator, v: u64) !void {
     try out.appendSlice(gpa, tmp[0..n]);
 }
 
-fn u64be(v: u64) [8]u8 {
-    return std.mem.toBytes(std.mem.nativeToBig(u64, v));
+/// Writes one integer parameter as `id | length | value`, with the value
+/// itself a QUIC variable-length integer (RFC 9000 section 16).
+///
+/// This used to write the value as eight raw big-endian bytes. That is not a
+/// varint at all: a reader derives the width from the top two bits of the
+/// first byte, so eight leading zeros declare a one-byte integer and the
+/// declared length no longer matches what was consumed. Our own decoder read
+/// the same eight bytes, so this only ever worked against another copy of
+/// this code; aioquic rejected the whole transport-parameters block with
+/// TRANSPORT_PARAMETER_ERROR.
+fn putIntParam(out: *std.ArrayList(u8), gpa: Allocator, id: u64, value: u64) !void {
+    var tmp: [8]u8 = undefined;
+    const n = varint.encode(tmp[0..], value) catch return error.BufferTooSmall;
+    try putV(out, gpa, id);
+    try putV(out, gpa, n);
+    try out.appendSlice(gpa, tmp[0..n]);
 }
 
 /// Encodes the numeric parameter set (CIDs appended separately by the
@@ -76,26 +90,26 @@ pub fn encode(out: *std.ArrayList(u8), gpa: Allocator, p: Params) !void {
     if (p.activeConnectionIdLimit < 2) return Error.InvalidParameter;
     // Only emit non-default values where the spec allows omission.
     if (p.maxIdleTimeoutMs != 0)
-        try putParam(out, gpa, @intFromEnum(ParamId.maxIdleTimeout), &u64be(p.maxIdleTimeoutMs));
-    try putParam(out, gpa, @intFromEnum(ParamId.maxUdpPayloadSize), &u64be(p.maxUdpPayloadSize));
+        try putIntParam(out, gpa, @intFromEnum(ParamId.maxIdleTimeout), p.maxIdleTimeoutMs);
+    try putIntParam(out, gpa, @intFromEnum(ParamId.maxUdpPayloadSize), p.maxUdpPayloadSize);
     if (p.initialMaxData != 0)
-        try putParam(out, gpa, @intFromEnum(ParamId.initialMaxData), &u64be(p.initialMaxData));
+        try putIntParam(out, gpa, @intFromEnum(ParamId.initialMaxData), p.initialMaxData);
     if (p.initialMaxStreamDataBidiLocal != 0)
-        try putParam(out, gpa, @intFromEnum(ParamId.initialMaxStreamDataBidiLocal), &u64be(p.initialMaxStreamDataBidiLocal));
+        try putIntParam(out, gpa, @intFromEnum(ParamId.initialMaxStreamDataBidiLocal), p.initialMaxStreamDataBidiLocal);
     if (p.initialMaxStreamDataBidiRemote != 0)
-        try putParam(out, gpa, @intFromEnum(ParamId.initialMaxStreamDataBidiRemote), &u64be(p.initialMaxStreamDataBidiRemote));
+        try putIntParam(out, gpa, @intFromEnum(ParamId.initialMaxStreamDataBidiRemote), p.initialMaxStreamDataBidiRemote);
     if (p.initialMaxStreamDataUni != 0)
-        try putParam(out, gpa, @intFromEnum(ParamId.initialMaxStreamDataUni), &u64be(p.initialMaxStreamDataUni));
+        try putIntParam(out, gpa, @intFromEnum(ParamId.initialMaxStreamDataUni), p.initialMaxStreamDataUni);
     if (p.initialMaxStreamsBidi != 0)
-        try putParam(out, gpa, @intFromEnum(ParamId.initialMaxStreamsBidi), &u64be(p.initialMaxStreamsBidi));
+        try putIntParam(out, gpa, @intFromEnum(ParamId.initialMaxStreamsBidi), p.initialMaxStreamsBidi);
     if (p.initialMaxStreamsUni != 0)
-        try putParam(out, gpa, @intFromEnum(ParamId.initialMaxStreamsUni), &u64be(p.initialMaxStreamsUni));
+        try putIntParam(out, gpa, @intFromEnum(ParamId.initialMaxStreamsUni), p.initialMaxStreamsUni);
     if (p.ackDelayExponent != 3)
-        try putParam(out, gpa, @intFromEnum(ParamId.ackDelayExponent), &u64be(p.ackDelayExponent));
+        try putIntParam(out, gpa, @intFromEnum(ParamId.ackDelayExponent), p.ackDelayExponent);
     if (p.maxAckDelayMs != 25)
-        try putParam(out, gpa, @intFromEnum(ParamId.maxAckDelay), &u64be(p.maxAckDelayMs));
+        try putIntParam(out, gpa, @intFromEnum(ParamId.maxAckDelay), p.maxAckDelayMs);
     if (p.activeConnectionIdLimit != 2)
-        try putParam(out, gpa, @intFromEnum(ParamId.activeConnectionIdLimit), &u64be(p.activeConnectionIdLimit));
+        try putIntParam(out, gpa, @intFromEnum(ParamId.activeConnectionIdLimit), p.activeConnectionIdLimit);
 }
 
 fn dv(data: []const u8, pos: *usize) Error!u64 {
@@ -156,13 +170,17 @@ pub fn decode(data: []const u8) Error!Params {
             // Length-validated above and carried by `parseCidParams`; there is
             // no numeric value to read.
             .originalDestinationConnectionId, .initialSourceConnectionId, .retrySourceConnectionId, .statelessResetToken => 0,
-            else => switch (len) {
-                0 => 0,
-                1 => data[pos],
-                2 => std.mem.readInt(u16, data[pos..][0..2], .big),
-                4 => std.mem.readInt(u32, data[pos..][0..4], .big),
-                8 => std.mem.readInt(u64, data[pos..][0..8], .big),
-                else => return Error.InvalidParameter, // numeric params are pow2-len BE
+            else => blk: {
+                // The declared length has to agree with the width the varint
+                // itself claims, or the reader and the writer disagree about
+                // where the next parameter starts. Checking this is what turns
+                // a malformed block into a clean TransportParameterError
+                // instead of a desynchronised parse.
+                if (len == 0) break :blk 0;
+                const before = pos;
+                const v = try dv(data, &pos);
+                if (pos - before != len) return Error.InvalidParameter;
+                break :blk v;
             },
         };
 
@@ -192,6 +210,10 @@ pub fn decode(data: []const u8) Error!Params {
             },
             else => {}, // unknown / CID-carrying handled by connection
         }
+        // Integer parameters were read with `dv`, which already advanced
+        // `pos` over exactly `len` bytes (verified above). Byte-carrying
+        // parameters did not move it, so only those step here.
+        if (is_int_param(id)) continue;
         pos += len;
     }
     return p;
@@ -360,9 +382,7 @@ test "unknown parameters are ignored whatever their length" {
     // stepped over rather than aborting the parse.
     var mixed = std.ArrayList(u8).empty;
     defer mixed.deinit(a);
-    var vb: [8]u8 = undefined;
-    std.mem.writeInt(u64, &vb, 1 << 20, .big);
-    try putParam(&mixed, a, @intFromEnum(ParamId.initialMaxData), vb[0..8]);
+    try putIntParam(&mixed, a, @intFromEnum(ParamId.initialMaxData), 1 << 20);
     try mixed.appendSlice(a, &[_]u8{ 0x11, 0x0C, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 });
     // ...and another unknown after it, so a skip that mis-advances `pos`
     // would desynchronise and fail here.
@@ -389,8 +409,54 @@ test "unknown parameters are ignored whatever their length" {
         // Duplicate known parameters are still rejected.
         var dup = std.ArrayList(u8).empty;
         defer dup.deinit(a);
-        try putParam(&dup, a, @intFromEnum(ParamId.initialMaxData), vb[0..8]);
-        try putParam(&dup, a, @intFromEnum(ParamId.initialMaxData), vb[0..8]);
+        try putIntParam(&dup, a, @intFromEnum(ParamId.initialMaxData), 1 << 20);
+        try putIntParam(&dup, a, @intFromEnum(ParamId.initialMaxData), 1 << 20);
         try std.testing.expectError(Error.DuplicateParameter, decode(dup.items));
     }
+}
+
+/// True for the parameters whose value is a variable-length integer, read
+/// through `dv` rather than as raw bytes.
+fn is_int_param(id: ParamId) bool {
+    return switch (id) {
+        .maxIdleTimeout, .maxUdpPayloadSize, .initialMaxData, .initialMaxStreamDataBidiLocal, .initialMaxStreamDataBidiRemote, .initialMaxStreamDataUni, .initialMaxStreamsBidi, .initialMaxStreamsUni, .ackDelayExponent, .maxAckDelay, .activeConnectionIdLimit, .disableActiveMigration => true,
+        else => false,
+    };
+}
+
+test "integer parameters are encoded as real varints" {
+    const a = std.testing.allocator;
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(a);
+
+    // 1<<20 needs the four-byte form. Written as raw big-endian it would be
+    // eight bytes whose first byte declares a one-byte integer, and a peer
+    // that reads the width from those bits finds eight bytes of padding
+    // where it expected a value -- which is how aioquic rejected the whole
+    // block with TRANSPORT_PARAMETER_ERROR.
+    try putIntParam(&out, a, @intFromEnum(ParamId.initialMaxData), 1 << 20);
+
+    try std.testing.expectEqual(@as(usize, 6), out.items.len);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(ParamId.initialMaxData)), out.items[0]);
+    try std.testing.expectEqual(@as(u8, 4), out.items[1]); // declared length
+    try std.testing.expectEqual(@as(u8, 0x80), out.items[2]); // varint prefix
+    try std.testing.expectEqual(@as(u8, 0x10), out.items[3]);
+
+    // And it has to round-trip through our own decoder.
+    const got = try decode(out.items);
+    try std.testing.expectEqual(@as(u64, 1 << 20), got.initialMaxData);
+}
+
+test "a parameter whose length disagrees with its varint width is rejected" {
+    const a = std.testing.allocator;
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(a);
+
+    // Declares a four-byte value, supplies eight bytes of big-endian: the
+    // exact shape the old encoder produced.
+    try putV(&out, a, @intFromEnum(ParamId.initialMaxData));
+    try putV(&out, a, 8);
+    try out.appendSlice(a, &[_]u8{ 0, 0, 0, 0, 0, 0x10, 0, 0 });
+
+    try std.testing.expectError(Error.InvalidParameter, decode(out.items));
 }

@@ -182,9 +182,11 @@ pub const Driver = struct {
             var vb: [8]u8 = undefined;
             var n = try quicVarint.encode(&vb, 0x00);
             try out.appendSlice(a, vb[0..n]);
-            n = try quicVarint.encode(&vb, conn.dcidLen);
+            // The DCID the client originally chose for us, which is not the one
+            // we send to: that is the client's own SCID (RFC 9000 7.3).
+            n = try quicVarint.encode(&vb, conn.origDcidLen);
             try out.appendSlice(a, vb[0..n]);
-            try out.appendSlice(a, conn.dcid[0..conn.dcidLen]);
+            try out.appendSlice(a, conn.origDcid[0..conn.origDcidLen]);
         }
         return out.toOwnedSlice(a);
     }
@@ -679,7 +681,7 @@ pub fn serveHandshake(serverEp: *Endpoint, pump: *transportMod.Pump, driver: ?*D
             const parsed = packetMod.parseLongHeader(d.data) catch continue;
             if (parsed.header.type != .initial) continue;
             serverEp.peer = d.from;
-            try serverEp.conn.acceptInitial(parsed.header.dcid, parsed.header.version);
+            try serverEp.conn.acceptInitial(parsed.header.dcid, parsed.header.scid, parsed.header.version);
             serverEp.conn.receiveDatagram(d.data, now) catch continue;
             booted = true;
             continue;
@@ -776,7 +778,7 @@ pub fn performHandshakeWithEarlyData(
                 const parsed = packetMod.parseLongHeader(d.data) catch continue;
                 if (parsed.header.type != .initial) continue;
                 sep.peer = d.from;
-                try sep.conn.acceptInitial(parsed.header.dcid, parsed.header.version);
+                try sep.conn.acceptInitial(parsed.header.dcid, parsed.header.scid, parsed.header.version);
                 sep.conn.receiveDatagram(d.data, now) catch continue;
                 serverBooted = true;
                 continue;

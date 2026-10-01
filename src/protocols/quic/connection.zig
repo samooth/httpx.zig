@@ -405,7 +405,15 @@ pub const Connection = struct {
     /// Initial keys were derived correctly either way. The bug is real and
     /// the plumbing was needed to prove it was not the culprit.
     pub fn installInitialKeys(self: *Connection) Error!void {
-        const secrets = crypto.initialSecrets(self.dcid[0..self.dcidLen], self.version) catch return Error.TlsDriverFailed;
+        return self.installInitialKeysFrom(self.dcid[0..self.dcidLen]);
+    }
+
+    /// Derives Initial keys from an explicit Destination Connection ID
+    /// (RFC 9001 section 5.2). The server needs this because the ID the
+    /// client chose for us and the ID we address the client by are
+    /// different, and only the former feeds the key derivation.
+    fn installInitialKeysFrom(self: *Connection, clientDcid: []const u8) Error!void {
+        const secrets = crypto.initialSecrets(clientDcid, self.version) catch return Error.TlsDriverFailed;
         const sp = &self.spaces[0];
         sp.keysTx = if (self.role == .client)
             crypto.initialProtection(secrets, .client)
@@ -1022,6 +1030,14 @@ pub const Connection = struct {
             const slice = dgram[off..];
             if (slice.len < 5) return;
             const first = slice[0];
+            // Padding out to the datagram boundary is not a packet.
+            // A real packet always has the header form (0x80) or the
+            // fixed bit (0x40) set in its first byte, so an all-zero
+            // tail can only be PADDING. Without this the trailing zeros
+            // of a 1200-byte Initial were handed to the short header
+            // path and rejected as a malformed packet, which turned every
+            // padded datagram from a real client into a failed receive.
+            if (first == 0) return;
             if ((first & 0x80) != 0 and std.mem.readInt(u32, slice[1..5], .big) == 0) {
                 return; // Version negotiation: policy handled above this layer.
             }
@@ -1229,6 +1245,26 @@ pub const Connection = struct {
         };
 
         const isZeroRtt = parsed.header.type == .zeroRtt;
+        // RFC 9000 section 5.3: a packet addressed to a connection ID we
+        // did not issue is not ours. Dropping it here is also what makes a
+        // wrong addressing convention visible instead of silently failing
+        // to interoperate. A server does not apply it to an Initial: that
+        // DCID is what the client chose to find the server, and a
+        // retransmitted Initial repeats it.
+        const serverInitial = self.role == .server and parsed.header.type == .initial;
+        if (!serverInitial and !std.mem.eql(u8, parsed.header.dcid, self.scid[0..self.scidLen])) return;
+
+        // RFC 9000 section 7.2: the client takes the server's Source
+        // Connection ID from its first flight and addresses everything after
+        // it there. The DCID we chose only ever got us to this server, so
+        // keeping it would send our Handshake packets nowhere.
+        if (self.role == .client and self.state != .established and parsed.header.scid.len > 0) {
+            if (parsed.header.scid.len <= 20) {
+                @memcpy(self.dcid[0..parsed.header.scid.len], parsed.header.scid);
+                self.dcidLen = @intCast(parsed.header.scid.len);
+            }
+        }
+
         const spIdx: usize = if (isZeroRtt) 2 else switch (parsed.header.type) {
             .initial => 0,
             .handshake => 1,
@@ -1275,7 +1311,9 @@ pub const Connection = struct {
         work[0] ^= mask[0] & 0x0F;
 
         // Reserved bits must be zero once unprotected.
-        if (work[0] & 0x0C != 0) return Error.ProtocolViolation;
+        if (work[0] & 0x0C != 0) {
+            return Error.ProtocolViolation;
+        }
         const pnLen: usize = (@as(usize, work[0]) & 0x03) + 1;
         for (0..pnLen) |i| work[pnOffset + i] ^= mask[1 + i];
         var pnTrunc: u64 = 0;
@@ -1332,6 +1370,12 @@ pub const Connection = struct {
         @memcpy(work[0..dgram.len], dgram);
 
         const pnOffset = 1 + self.scidLen; // peer uses OUR scid as dcid
+
+        // RFC 9000 section 5.3, as in the long header path: a packet for a
+        // connection ID we did not issue is not ours. Checked before any
+        // key is touched, so a stray packet costs nothing and a wrong
+        // addressing convention cannot hide behind a decryption failure.
+        if (!std.mem.eql(u8, work[1..pnOffset], self.scid[0..self.scidLen])) return;
         if (dgram.len < pnOffset + 20) return Error.ProtocolViolation;
 
         var sample: [16]u8 = undefined;
@@ -1745,12 +1789,25 @@ pub const Connection = struct {
     /// first datagram before processing it.
     /// `version` is the one from the peer's first long header; it selects the
     /// initial salt. Defaults to v1 so direct callers keep their behaviour.
-    pub fn acceptInitial(self: *Connection, clientDcid: []const u8, version: u32) Error!void {
+    /// Adopts a client's first Initial: `clientDcid` is the ID it chose for
+    /// us, `clientScid` is its own.
+    ///
+    /// These two are not interchangeable. Initial keys come from the former
+    /// (RFC 9001 section 5.2), but everything we send afterwards has to be
+    /// addressed to the latter (RFC 9000 section 7.2). Addressing our reply
+    /// to `clientDcid` looked plausible and worked between two copies of
+    /// this code, but a real client rejected every packet with
+    /// unknown_connection_id, because the only ID it will accept as a
+    /// destination is the one it sent us.
+    pub fn acceptInitial(self: *Connection, clientDcid: []const u8, clientScid: []const u8, version: u32) Error!void {
         if (self.role != .server) return Error.ProtocolViolation;
-        @memcpy(self.dcid[0..clientDcid.len], clientDcid);
-        self.dcidLen = @intCast(clientDcid.len);
+        if (clientDcid.len > 20 or clientScid.len > 20) return Error.ProtocolViolation;
         self.version = version;
-        self.installInitialKeys() catch return Error.TlsDriverFailed;
+        self.installInitialKeysFrom(clientDcid) catch return Error.TlsDriverFailed;
+        @memcpy(self.origDcid[0..clientDcid.len], clientDcid);
+        self.origDcidLen = @intCast(clientDcid.len);
+        @memcpy(self.dcid[0..clientScid.len], clientScid);
+        self.dcidLen = @intCast(clientScid.len);
     }
 
     pub fn takeOutput(self: *Connection, gpa: Allocator) ![]u8 {
@@ -1870,7 +1927,7 @@ test "loopback connection pair completes protected handshake and stream" {
     try std.testing.expect(cOut.len >= 64);
 
     // Server accepts based on the DCID the client used.
-    try server.acceptInitial(client.dcid[0..8], 0x00000001);
+    try server.acceptInitial(client.dcid[0..8], client.scid[0..8], 0x00000001);
     try server.receiveDatagram(cOut, 100);
 
     // Server produced Handshake + Application responses.
@@ -2121,7 +2178,7 @@ fn runTlsHandshake(
     defer a.free(c0);
     try std.testing.expect(c0.len >= 64);
 
-    try server.acceptInitial(client.dcid[0..8], 0x00000001);
+    try server.acceptInitial(client.dcid[0..8], client.scid[0..8], 0x00000001);
     try server.receiveDatagram(c0, 100);
 
     const s0 = try server.takeOutput(a);
@@ -2531,11 +2588,18 @@ const CtlPair = struct {
         const server = try Connection.init(a, std.Io.Threaded.global_single_threaded.io(), .server, .{});
         errdefer server.deinit();
         // Mirrored 1-RTT secrets (same loopback convention as the
-        // handshake tests); CIDs need no alignment for short headers.
+        // handshake tests).
         const secret = [_]u8{0xA5} ** 32;
         try client.installKeys(.application, secret, secret);
         try server.installKeys(.application, secret, secret);
         server.addressValidated = true;
+        // Each side must address the other's issued connection ID. Short
+        // header packets are checked against it now (RFC 9000 section 5.3),
+        // so skipping this no longer works.
+        @memcpy(server.dcid[0..client.scidLen], client.scid[0..client.scidLen]);
+        server.dcidLen = client.scidLen;
+        @memcpy(client.dcid[0..server.scidLen], server.scid[0..server.scidLen]);
+        client.dcidLen = server.scidLen;
         return .{ .client = client, .server = server };
     }
 
@@ -2981,7 +3045,7 @@ test "replay aioquic client initial" {
 
     var srv = try Connection.init(a, nctx.io, .server, .{});
     defer srv.deinit();
-    try srv.acceptInitial(parsed.header.dcid, parsed.header.version);
+    try srv.acceptInitial(parsed.header.dcid, parsed.header.scid, parsed.header.version);
 
     // A no-op TLS driver: enough to prove the packet was decrypted and its
     // CRYPTO frame handed upwards. Without it the driver is null and the
@@ -3291,4 +3355,48 @@ test "retiring one of our connection ids triggers a replacement" {
 
     // A sequence we never issued is a protocol violation, not a no-op.
     try std.testing.expectError(Error.ProtocolViolation, srv.handleRetireForTest(9999, 400));
+}
+
+test "a server addresses its replies to the client's own connection id" {
+    const a = std.testing.allocator;
+    var srv = try Connection.init(a, std.Io.Threaded.global_single_threaded.io(), .server, .{});
+    defer srv.deinit();
+
+    const clientDcid = [_]u8{ 0xA1, 0xA2, 0xA3, 0xA4 };
+    const clientScid = [_]u8{ 0xB1, 0xB2, 0xB3, 0xB4 };
+    try srv.acceptInitial(&clientDcid, &clientScid, 0x00000001);
+
+    // Everything we send is addressed to the client's SCID...
+    try std.testing.expectEqualSlices(u8, &clientScid, srv.dcid[0..srv.dcidLen]);
+    // ...while the DCID the client chose to find us is kept only for the
+    // original_destination_connection_id parameter.
+    try std.testing.expectEqualSlices(u8, &clientDcid, srv.origDcid[0..srv.origDcidLen]);
+
+    // Initial keys come from the chosen DCID, which is what made the reply
+    // decryptable but not recognisable.
+    try std.testing.expect(srv.spaces[0].keysTx != null);
+    try std.testing.expect(srv.spaces[0].keysRx != null);
+}
+
+test "a packet addressed to a connection id we never issued is dropped" {
+    const a = std.testing.allocator;
+    var cli = try Connection.init(a, std.Io.Threaded.global_single_threaded.io(), .client, .{});
+    defer cli.deinit();
+    try cli.installKeys(.application, @splat(0xA1), @splat(0xB2));
+    cli.state = .established;
+
+    // A short header packet claiming to be for us, but not carrying our SCID.
+    var packet: [64]u8 = @splat(0x11);
+    packet[0] = 0x40; // short header, fixed bit
+    packet[1] = 0xEE; // wrong DCID
+
+    // Dropped silently: this is not a connection error, just a packet that
+    // is not ours.
+    cli.receiveDatagram(&packet, 100) catch |e| switch (e) {
+        error.ProtocolViolation, error.AuthenticationFailed => {
+            return error.RejectedInsteadOfDropped;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(i64, -1), cli.spaces[2].highestRxPn);
 }
