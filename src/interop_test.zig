@@ -140,6 +140,37 @@ const Harness = struct {
         return .{ .server = server, .thread = thread, .port = port };
     }
 
+    /// A server speaking HTTP/3 over QUIC, for the aioquic client.
+    ///
+    /// Same shape as the HTTP/1.1 harness: bind, then run on a thread so the
+    /// child process has someone to answer it. `httpVersion = .http3` is what
+    /// selects the QUIC transport and the `h3` ALPN; the certificate is the
+    /// self-signed test pair.
+    fn startHttp3(alloc: std.mem.Allocator, io: std.Io) !Harness {
+        const server = try alloc.create(httpx.Server);
+        errdefer alloc.destroy(server);
+        server.* = try httpx.Server.init(alloc, io, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .maxConnections = 4,
+            .enableDocs = false,
+            .logging = .{},
+            .httpVersion = .http3,
+            .tls = .{ .certificatePem = interop_cert, .privateKeyPem = interop_key },
+        });
+        errdefer server.deinit();
+        try server.get("/ping", helloHandler);
+        const port = server.localPort();
+
+        const Run = struct {
+            fn go(s: *httpx.Server) void {
+                s.run();
+            }
+        };
+        const thread = try std.Thread.spawn(.{}, Run.go, .{server});
+        return .{ .server = server, .thread = thread, .port = port };
+    }
+
     fn stop(self: *Harness, alloc: std.mem.Allocator) void {
         self.server.stop();
         self.thread.join();
@@ -482,4 +513,72 @@ test "interop: our client completes a post-quantum handshake with openssl s_serv
     std.debug.print("\n---OPENSSL-SSERVER-HYBRID---\n{s}\n---END---\n", .{out});
 
     try std.testing.expectEqual(@as(u16, 200), resp.status);
+}
+
+/// The HTTP/3 client driven by the QUIC interop test.
+///
+/// Kept as a real file rather than a string literal so it stays readable and
+/// can be run by hand against a listening server, which is how the QUIC
+/// interop work was debugged in the first place.
+const aioquic_client = @embedFile("protocols/quic/testdata/aioquic_client.py");
+
+/// Whether a usable aioquic is importable.
+///
+/// Asked of the interpreter rather than assumed from a version, for the same
+/// reason `opensslKnowsGroup` asks the binary: a distribution could ship the
+/// package under a version this test did not anticipate, and asserting on the
+/// absence of a feature we never installed is not evidence of anything.
+fn aioquicAvailable(io: std.Io) bool {
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "python3", "-c", "import aioquic, sys; sys.exit(0)" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return false;
+    const term = child.wait(io) catch return false;
+    return switch (term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+}
+
+test "interop: aioquic completes an HTTP/3 request against us" {
+    if (skipUnlessInterop()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+
+    // No runner ships aioquic, so this is the one interop test that may
+    // legitimately skip on capability rather than version.
+    if (!aioquicAvailable(io)) {
+        std.debug.print("\nSKIP aioquic not importable; HTTP/3 interop not exercised\n", .{});
+        return error.SkipZigTest;
+    }
+
+    var h = try Harness.startHttp3(a, io);
+    defer h.stop(a);
+
+    const script_path = ".httpx-interop-aioquic.py";
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, script_path, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, aioquic_client);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, script_path) catch {};
+
+    const port_str = try std.fmt.allocPrint(a, "{d}", .{h.port});
+    defer a.free(port_str);
+
+    const out = try runClient(a, io, &.{ "python3", script_path, port_str }, null);
+    defer a.free(out);
+    if (std.mem.indexOf(u8, out, "RESULT ok") == null) {
+        std.debug.print("\n---AIOQUIC-OUTPUT---\n{s}\n---END---\n", .{out});
+    }
+
+    // Each of these is the client's own report. A QUIC or HTTP/3 regression
+    // that we were making to ourselves would not show up here, which is the
+    // whole reason this test exists.
+    try std.testing.expect(std.mem.indexOf(u8, out, "HANDSHAKE completed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "STATUS 200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "httpx-interop-ok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "RESULT ok") != null);
 }

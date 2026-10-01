@@ -1187,11 +1187,11 @@ pub const Server = struct {
             .onData = quicHs.Driver.onData,
         };
 
-        try quicHs.serveHandshake(ep, pump, &drv, 10_000);
-
-        var h3 = http3Conn.Connection.init(self.allocator, .server);
-        defer h3.deinit();
-
+        // Registered before the handshake, not after. A client commonly puts
+        // its Finished and its first request in one datagram, and that
+        // datagram is processed by the call that completes the handshake --
+        // so a callback attached afterwards never sees the request, and every
+        // HTTP/3 connection silently lost its first one.
         const Acc = struct {
             sid: u64 = std.math.maxInt(u64),
             buf: std.ArrayList(u8) = .empty,
@@ -1209,6 +1209,11 @@ pub const Server = struct {
         var acc = Acc{};
         defer acc.buf.deinit(std.heap.page_allocator);
         qconn.cbs = .{ .ctx = &acc, .onStreamData = Acc.onStream };
+
+        try quicHs.serveHandshake(ep, pump, &drv, 10_000);
+
+        var h3 = http3Conn.Connection.init(self.allocator, .server);
+        defer h3.deinit();
 
         const startMs: u64 = @intCast(clock.millisNow());
         while (!self.stopFlag.load(.acquire) and !self.h3Stop.load(.acquire)) {
