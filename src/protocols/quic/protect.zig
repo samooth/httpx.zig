@@ -87,10 +87,19 @@ pub fn applyHeaderProtection(
 
 // Payload protection
 
-/// Nonce = IV with the last 8 bytes XORed with the big-endian packet number.
+/// Nonce = IV with the last 8 bytes XORed with the packet number,
+/// big-endian (RFC 9001 section 5.3).
+///
+/// The byte order matters and was wrong here: `toBytes` gives the native
+/// order, so on a little-endian host the least significant byte landed in
+/// nonce[4] and the most significant in nonce[11] -- the reverse of the
+/// spec. Packet number 0 XORs nothing, so the first packet of a
+/// connection authenticated and every later one failed, against any peer
+/// that was not another copy of this code.
 pub fn buildNonce(iv: *const [12]u8, pn: u64) [12]u8 {
     var nonce: [12]u8 = iv.*;
-    const be = std.mem.toBytes(pn);
+    var be: [8]u8 = undefined;
+    std.mem.writeInt(u64, &be, pn, .big);
     for (0..8) |i| {
         nonce[4 + i] ^= be[i];
     }
@@ -426,4 +435,44 @@ test "retry integrity tag matches RFC 9001 A.4" {
     retryIntegrityTag(odcid[0..], retryBody[0..], &tag);
     const want = [_]u8{ 0x04, 0xa2, 0x65, 0xba, 0x2e, 0xff, 0x4d, 0x82, 0x90, 0x58, 0xfb, 0x3f, 0x0f, 0x24, 0x96, 0xba };
     try std.testing.expectEqualSlices(u8, &want, &tag);
+}
+
+test "the packet number is XORed into the nonce big-endian" {
+    // RFC 9001 section 5.3: the nonce is the IV with the packet number
+    // XORed into its last eight bytes, most significant byte first. Using
+    // the native byte order reversed the two ends of that field, which is
+    // invisible for packet number 0 and wrong for every other one.
+    const iv = [_]u8{ 0x52, 0x36, 0x5e, 0x69, 0xc2, 0x58, 0x1e, 0xa8, 0xf9, 0xf7, 0x19, 0x74 };
+
+    // Zero changes nothing, which is exactly why the first packet of a
+    // connection authenticated and the rest did not.
+    try std.testing.expectEqualSlices(u8, &iv, &buildNonce(&iv, 0));
+
+    // 1 belongs in the last byte.
+    try std.testing.expectEqualSlices(
+        u8,
+        &[_]u8{ 0x52, 0x36, 0x5e, 0x69, 0xc2, 0x58, 0x1e, 0xa8, 0xf9, 0xf7, 0x19, 0x75 },
+        &buildNonce(&iv, 1),
+    );
+
+    // 0x100 has its only set bit one past the low byte, so it must land in
+    // the second to last byte of the field, not the last.
+    try std.testing.expectEqualSlices(
+        u8,
+        &[_]u8{ 0x52, 0x36, 0x5e, 0x69, 0xc2, 0x58, 0x1e, 0xa8, 0xf9, 0xf7, 0x18, 0x74 },
+        &buildNonce(&iv, 0x100),
+    );
+    // ...and setting the low bit as well touches the last byte too.
+    try std.testing.expectEqualSlices(
+        u8,
+        &[_]u8{ 0x52, 0x36, 0x5e, 0x69, 0xc2, 0x58, 0x1e, 0xa8, 0xf9, 0xf7, 0x18, 0x75 },
+        &buildNonce(&iv, 0x101),
+    );
+
+    // The field is nonce[4..12]: a value that fills it must reach nonce[4]
+    // and leave the first four bytes of the IV alone.
+    const big = buildNonce(&iv, 0x0102_0304_0506_0708);
+    try std.testing.expectEqualSlices(u8, iv[0..4], big[0..4]);
+    try std.testing.expectEqual(@as(u8, 0xc2 ^ 0x01), big[4]);
+    try std.testing.expectEqual(@as(u8, 0x74 ^ 0x08), big[11]);
 }

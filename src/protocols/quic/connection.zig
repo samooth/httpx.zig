@@ -1329,8 +1329,10 @@ pub const Connection = struct {
         const ctLen = declaredEnd - aadLen - 16;
 
         var pt: [MAX_DATAGRAM]u8 = undefined;
-        protect.openWithKeys(pt[0..ctLen], work[aadLen..][0..ctLen], work[declaredEnd - 16 ..][0..16].*, work[0..aadLen], keys, pn) catch
-            return Error.AuthenticationFailed;
+        protect.openWithKeys(pt[0..ctLen], work[aadLen..][0..ctLen], work[declaredEnd - 16 ..][0..16].*, work[0..aadLen], keys, pn) catch {
+            protect.openWithKeys(pt[0..ctLen], work[aadLen..][0..ctLen], work[declaredEnd - 16 ..][0..16].*, work[0..aadLen], keys, pn) catch
+                return Error.AuthenticationFailed;
+        };
 
         if (isZeroRtt) {
             if (self.maxEarlyData > 0) {
@@ -3399,4 +3401,38 @@ test "a packet addressed to a connection id we never issued is dropped" {
         else => {},
     };
     try std.testing.expectEqual(@as(i64, -1), cli.spaces[2].highestRxPn);
+}
+
+test "replay aioquic second flight: initial ack, handshake finished, 1rtt" {
+    // Captured from aioquic 1.2.0 in the same run as the destination
+    // connection ID below, so the Initial keys can be re-derived from it.
+    // The client's Original Destination Connection ID for this run.
+    const odcid = [_]u8{ 0xd8, 0x03, 0x34, 0xf5, 0x09, 0xa7, 0x46, 0xab };
+    // The Source Connection ID the client used throughout.
+    const clientScid = [_]u8{ 0x6e, 0xa4, 0x27, 0x4c, 0x00, 0xc5, 0x4d, 0xfc };
+
+    const a = std.testing.allocator;
+    var srv = try Connection.init(a, std.Io.Threaded.global_single_threaded.io(), .server, .{});
+    defer srv.deinit();
+    try srv.acceptInitial(&odcid, &clientScid, 0x00000001);
+
+    // Control: the first flight (ClientHello) with the same keys.
+    var ctl = try Connection.init(a, std.Io.Threaded.global_single_threaded.io(), .server, .{});
+    defer ctl.deinit();
+    try ctl.acceptInitial(&odcid, &clientScid, 0x00000001);
+    const first = @embedFile("testdata/aioquic_first_flight.bin");
+    ctl.receiveDatagram(first, 100) catch |e| switch (e) {
+        error.AuthenticationFailed => return error.FirstFlightNotDecrypted,
+        else => return e,
+    };
+    try std.testing.expect(ctl.spaces[0].highestRxPn >= 0);
+
+    const flight = @embedFile("testdata/aioquic_second_flight.bin");
+    // First packet of the datagram: an Initial carrying only an ACK.
+    srv.receiveDatagram(flight, 100) catch |e| switch (e) {
+        error.AuthenticationFailed => return error.SecondFlightNotDecrypted,
+        else => return e,
+    };
+    // The ACK has to have been recorded for the space to have made progress.
+    try std.testing.expect(srv.spaces[0].highestRxPn >= 1);
 }
