@@ -165,15 +165,6 @@ pub const MAX_DATAGRAM = 1500;
 pub const MAX_PEER_CONNECTION_IDS = 16;
 const MAX_CRYPTO_SEGMENTS = 1024;
 
-/// Packets we may protect under one set of 1-RTT keys before rotating.
-///
-/// RFC 9001 section 6 ties the update to the AEAD confidentiality limit,
-/// which is what makes it mandatory rather than discretionary: at 2^21 packets
-/// AES-GCM starts to leak key-dependent information. The exact figure depends
-/// on the cipher, so it is stated once for the ciphers this build uses rather
-/// than implied to be universal.
-const KEY_UPDATE_LIMIT: u64 = 1 << 21;
-
 /// Floor on how often a PMTU probe may be sent. RFC 9000 ties probing to
 /// the PTO; a fixed interval keeps this state machine trivial.
 const PROBE_INTERVAL_MS = 300;
@@ -461,6 +452,22 @@ pub const Connection = struct {
     /// are re-derived from it, and the phase bit flips. Receive keeps its own
     /// phase: each side updates independently, which is why the peer is what
     /// tells us to move.
+    /// Packets we may protect under one set of keys before rotating.
+    ///
+    /// RFC 9001 section 6 ties the update to the AEAD confidentiality limit,
+    /// which is what makes it mandatory rather than discretionary: past that
+    /// many packets the AEAD leaks key-dependent information. The figure is a
+    /// property of the cipher, not of QUIC, so a single constant would either
+    /// rotate too eagerly or -- for the weakest cipher -- not often enough.
+    /// AES-128-GCM is the tight one at 2^21; the 256-bit and ChaCha ciphers get
+    /// 2^23.
+    fn confidentialityLimit(cipher: crypto.Cipher) u64 {
+        return switch (cipher) {
+            .aes128Gcm => 1 << 21,
+            .aes256Gcm, .chacha20Poly1305 => 1 << 23,
+        };
+    }
+
     pub fn initiateKeyUpdate(self: *Connection) !void {
         const sp = &self.spaces[@intFromEnum(SpaceKind.application)];
         const cur = sp.txSecret orelse return Error.TlsDriverFailed;
@@ -841,7 +848,7 @@ pub const Connection = struct {
         // whole mechanism was never enforced.
         if (kind == .application and !isZeroRtt) {
             sp.packetsInPhase += 1;
-            if (sp.packetsInPhase >= KEY_UPDATE_LIMIT) {
+            if (sp.packetsInPhase >= confidentialityLimit(sp.keysTx.?.cipher)) {
                 // Best effort: with no application secret installed yet there is
                 // nothing to rotate, so drop the counter rather than spin.
                 self.initiateKeyUpdate() catch {
@@ -3515,9 +3522,9 @@ test "1-RTT keys rotate on their own once the confidentiality limit is reached" 
     frames.encode(&payload, a, .ping) catch return;
 
     // One short of the limit: the packet below it does not rotate.
-    sp.packetsInPhase = KEY_UPDATE_LIMIT - 2;
+    sp.packetsInPhase = Connection.confidentialityLimit(sp.keysTx.?.cipher) - 2;
     try cli.packetize(.application, &payload, 100);
-    try std.testing.expectEqual(@as(u64, KEY_UPDATE_LIMIT - 1), sp.packetsInPhase);
+    try std.testing.expectEqual(@as(u64, Connection.confidentialityLimit(sp.keysTx.?.cipher) - 1), sp.packetsInPhase);
     try std.testing.expect(!sp.txKeyPhase);
     try std.testing.expectEqualSlices(u8, &firstSecret, &sp.txSecret.?);
 
@@ -3527,4 +3534,29 @@ test "1-RTT keys rotate on their own once the confidentiality limit is reached" 
     try std.testing.expect(sp.txKeyPhase);
     try std.testing.expect(!std.mem.eql(u8, &firstSecret, &sp.txSecret.?));
     try std.testing.expectEqual(@as(u64, 0), sp.packetsInPhase);
+}
+
+test "the key update limit follows the negotiated cipher" {
+    // A single constant would be wrong in one direction or the other: too
+    // eager for the ciphers that tolerate more, or not frequent enough for
+    // AES-128-GCM, which is the one that actually sets the constraint.
+    try std.testing.expectEqual(
+        @as(u64, 1 << 21),
+        Connection.confidentialityLimit(.aes128Gcm),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 1 << 23),
+        Connection.confidentialityLimit(.aes256Gcm),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 1 << 23),
+        Connection.confidentialityLimit(.chacha20Poly1305),
+    );
+
+    // The weakest cipher is also the strictest, which is the whole reason the
+    // limit cannot be a constant.
+    try std.testing.expect(
+        Connection.confidentialityLimit(.aes128Gcm) <
+            Connection.confidentialityLimit(.chacha20Poly1305),
+    );
 }
