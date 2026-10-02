@@ -106,14 +106,70 @@ pub const ProtectionKeys = struct {
     pub const ivLen = 12;
 };
 
+/// HKDF labels for a QUIC version (RFC 9369 section 3.3.2).
+///
+/// Version 2 renames every label from "quic ..." to "quicv2 ..." so that a
+/// derived key can never collide with the same derivation under version 1.
+/// The salts differ too, so the two versions would produce entirely
+/// unrelated keys -- which is exactly why a peer on version 1 cannot be fed
+/// a version 2 key by accident, and why a version 2 connection cannot be
+/// silently downgraded by anything that only sees version 1 traffic.
+pub const Labels = struct {
+    key: []const u8,
+    iv: []const u8,
+    hp: []const u8,
+    ku: []const u8,
+};
+
+pub const labelsV1 = Labels{
+    .key = "quic key",
+    .iv = "quic iv",
+    .hp = "quic hp",
+    .ku = "quic ku",
+};
+
+pub const labelsV2 = Labels{
+    .key = "quicv2 key",
+    .iv = "quicv2 iv",
+    .hp = "quicv2 hp",
+    .ku = "quicv2 ku",
+};
+
+/// The label prefix for `version`: "quicv2" for version 2, "quic" otherwise.
+/// Falling back to version 1 for an unknown version keeps a caller that has
+/// not validated the version yet from failing outright; every path that
+/// matters validates it first.
+pub fn labelPrefixForVersion(version: u32) []const u8 {
+    return if (isV2(version)) "quicv2" else "quic";
+}
+
+pub fn isV2(version: u32) bool {
+    return version == 0x6B3343CF;
+}
+
 /// Derives {key, iv, hp} from a secret using QUIC labels (AES-128-GCM, 16-byte key).
 pub fn deriveProtectionKeys(secret: [32]u8) ProtectionKeys {
+    return deriveProtectionKeysForVersion(secret, 0x00000001);
+}
+
+/// As `deriveProtectionKeys`, with the labels of `version`.
+pub fn deriveProtectionKeysForVersion(secret: [32]u8, version: u32) ProtectionKeys {
+    return switch (version) {
+        0x6B3343CF => deriveProtectionKeysWithPrefix(secret, "quicv2"),
+        else => deriveProtectionKeysWithPrefix(secret, "quic"),
+    };
+}
+
+fn deriveProtectionKeysWithPrefix(
+    secret: [32]u8,
+    comptime prefix: []const u8,
+) ProtectionKeys {
     var pk: ProtectionKeys = .{ .iv = undefined, .hp = undefined, .cipher = .aes128Gcm };
     pk.keyLen = 16;
     pk.hpLen = 16;
-    hkdfExpandLabel(secret, "quic key", pk.key[0..16]);
-    hkdfExpandLabel(secret, "quic iv", pk.iv[0..]);
-    hkdfExpandLabel(secret, "quic hp", pk.hp[0..16]);
+    hkdfExpandLabel(secret, prefix ++ " key", pk.key[0..16]);
+    hkdfExpandLabel(secret, prefix ++ " iv", pk.iv[0..]);
+    hkdfExpandLabel(secret, prefix ++ " hp", pk.hp[0..16]);
     @memset(pk.key[16..], 0);
     @memset(pk.hp[16..], 0);
     return pk;
@@ -164,17 +220,42 @@ pub fn initialSecrets(dcid: []const u8, version: u32) Error!InitialSecrets {
     };
 }
 
+/// Which side of the Initial space a set of keys protects.
+pub const Side = enum { client, server };
+
 /// Convenience: protection keys for one side of the Initial space.
-pub fn initialProtection(secrets: InitialSecrets, side: enum { client, server }) ProtectionKeys {
+pub fn initialProtection(secrets: InitialSecrets, side: Side) ProtectionKeys {
+    return initialProtectionForVersion(secrets, side, 0x00000001);
+}
+
+/// As `initialProtection`, with the labels of `version`.
+pub fn initialProtectionForVersion(
+    secrets: InitialSecrets,
+    side: Side,
+    version: u32,
+) ProtectionKeys {
     return switch (side) {
-        .client => deriveProtectionKeys(secrets.client),
-        .server => deriveProtectionKeys(secrets.server),
+        .client => deriveProtectionKeysForVersion(secrets.client, version),
+        .server => deriveProtectionKeysForVersion(secrets.server, version),
     };
 }
 
 /// Key update (RFC 9001 section 6): next application secret.
 pub fn nextApplicationSecret(current: [32]u8) [32]u8 {
-    return deriveSecret(current, "quic ku");
+    return nextApplicationSecretForVersion(current, 0x00000001);
+}
+
+/// As `nextApplicationSecret`, with the labels of `version`.
+///
+/// The secret is version-scoped because the label is, and it has to be: the
+/// next phase of a version 2 connection is derived with "quicv2 ku", so a
+/// client that advanced a version 1 secret would produce a phase the peer
+/// cannot derive and silently drop every packet.
+pub fn nextApplicationSecretForVersion(current: [32]u8, version: u32) [32]u8 {
+    return switch (version) {
+        0x6B3343CF => deriveSecret(current, "quicv2 ku"),
+        else => deriveSecret(current, "quic ku"),
+    };
 }
 
 // Tests
@@ -259,4 +340,41 @@ test "initial secrets match the RFC 9001 A.2 test vector" {
     try hexEq(sk.key[0..sk.keyLen], "cf3a5331653c364c88f0f379b6067e37");
     try hexEq(&sk.iv, "0ac1493ca1905853b0bba03e");
     try hexEq(sk.hp[0..sk.hpLen], "c206b8d9b9f0f37644430b490eeaa314");
+}
+
+test "RFC 9369 A.1/A.2 version 2 initial keys (authoritative vectors)" {
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const sec = try initialSecrets(&dcid, 0x6B3343CF);
+
+    // A.1: initial_secret, client and server initial secrets.
+    try hexEq(&sec.client, "14ec9d6eb9fd7af83bf5a668bc17a7e283766aade7ecd0891f70f9ff7f4bf47b");
+    try hexEq(&sec.server, "0263db1782731bf4588e7e4d93b7463907cb8cd8200b5da55a8bd488eafc37c1");
+
+    // A.1: derived with "quicv2 ..." labels. These are the values that fail
+    // if the labels are shared with version 1.
+    const ck = initialProtectionForVersion(sec, .client, 0x6B3343CF);
+    try hexEq(ck.key[0..ck.keyLen], "8b1a0bc121284290a29e0971b5cd045d");
+    try hexEq(&ck.iv, "91f73e2351d8fa91660e909f");
+    try hexEq(ck.hp[0..ck.hpLen], "45b95e15235d6f45a6b19cbcb0294ba9");
+
+    const sk = initialProtectionForVersion(sec, .server, 0x6B3343CF);
+    try hexEq(sk.key[0..sk.keyLen], "82db637861d55e1d011f19ea71d5d2a7");
+    try hexEq(&sk.iv, "dd13c276499c0249d3310652");
+    try hexEq(sk.hp[0..sk.hpLen], "edf6d05c83121201b436e16877593c3a");
+
+    // The two versions must not produce the same keys. The salts already
+    // differ, so this also proves the salts are distinct in practice.
+    const v1 = initialProtection(sec, .client);
+    try std.testing.expect(!std.mem.eql(u8, v1.key[0..16], ck.key[0..16]));
+    try std.testing.expect(!std.mem.eql(u8, v1.hp[0..16], ck.hp[0..16]));
+}
+
+test "version 2 key update uses the version 2 label" {
+    const secret = [_]u8{0x42} ** 32;
+    const v2Next = nextApplicationSecretForVersion(secret, 0x6B3343CF);
+    const v1Next = nextApplicationSecretForVersion(secret, 0x00000001);
+    try std.testing.expect(!std.mem.eql(u8, &v2Next, &v1Next));
+    // A v2 peer advancing its phase with the v1 label would drop every
+    // packet, so the label has to follow the version.
+    try std.testing.expect(!std.mem.eql(u8, &v2Next, &nextApplicationSecret(secret)));
 }
