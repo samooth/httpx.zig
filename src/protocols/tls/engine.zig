@@ -1800,7 +1800,7 @@ pub const Engine = struct {
         try self.io.randomSecure(&ageAdd);
         const ageAddV = std.mem.readInt(u32, &ageAdd, .big);
         const alpnWire = if (self.negotiatedAlpn) |a| a else "";
-        const blob = keys.seal(psk, suite, nowMs, lifetimeSecs, ageAddV, self.maxEarlyData, alpnWire);
+        const blob = try keys.seal(self.io, psk, suite, nowMs, lifetimeSecs, ageAddV, self.maxEarlyData, alpnWire);
         const maxEd: ?u32 = if (self.maxEarlyData > 0) self.maxEarlyData else null;
         const nst = handshakeMod.NewSessionTicket{
             .lifetimeSecs = lifetimeSecs,
