@@ -173,6 +173,64 @@ pub const BuildInfo = struct {
 /// which is the whole reason the packet exists: without it a peer whose
 /// preferred version is unsupported gets silence instead of a negotiation
 /// it can act on.
+/// Parsed Version Negotiation packet (RFC 9000 section 17.2.1).
+///
+/// This is the one packet whose Version field is zero, so it is not
+/// version-specific and is recognised on receipt by that field rather
+/// than by parsing it as an ordinary long header.
+pub const VersionNegotiation = struct {
+    /// Must equal the Source Connection ID we sent, and the Source must
+    /// equal the Destination Connection ID we chose. Echoing both is the
+    /// only thing distinguishing a real reply from a forged one.
+    dcid: []const u8,
+    scid: []const u8,
+    /// The versions the peer speaks, in its own order of preference.
+    /// Points into the input buffer.
+    /// Raw 4-byte version entries in wire order, still inside the
+    /// input buffer. Not decoded to u32 here because this runs on the
+    /// receive path of a packet we did not ask for, and there is no
+    /// reason to allocate in order to read it.
+    versionBytes: []const u8,
+
+    pub fn count(self: VersionNegotiation) usize {
+        return self.versionBytes.len / 4;
+    }
+
+    pub fn versionAt(self: VersionNegotiation, i: usize) u32 {
+        return std.mem.readInt(u32, self.versionBytes[i * 4 ..][0..4], .big);
+    }
+};
+
+/// Parses a Version Negotiation packet.
+///
+/// RFC 9000 section 17.2.1 sets the Unused field to an arbitrary value
+/// and requires clients to ignore it, so nothing here reads it beyond
+/// checking that this is a long header. The version list must be a whole
+/// number of 4-byte entries; a trailing partial entry makes the packet
+/// malformed rather than something to skip, since it cannot have come
+/// from a conforming server.
+pub fn parseVersionNegotiation(data: []const u8) HeaderError!VersionNegotiation {
+    if (data.len < 7) return HeaderError.Truncated;
+    if ((data[0] & 0x80) == 0) return HeaderError.InvalidPacket;
+    if (std.mem.readInt(u32, data[1..5], .big) != 0) return HeaderError.InvalidPacket;
+    var offset: usize = 5;
+
+    const dcidLen: usize = data[offset];
+    offset += 1;
+    if (dcidLen > 20) return HeaderError.InvalidPacket;
+    const dcid = try take(data, &offset, dcidLen);
+
+    if (offset >= data.len) return HeaderError.Truncated;
+    const scidLen: usize = data[offset];
+    offset += 1;
+    if (scidLen > 20) return HeaderError.InvalidPacket;
+    const scid = try take(data, &offset, scidLen);
+
+    if (offset == data.len) return HeaderError.InvalidPacket;
+    if ((data.len - offset) % 4 != 0) return HeaderError.InvalidPacket;
+
+    return .{ .dcid = dcid, .scid = scid, .versionBytes = data[offset..] };
+}
 pub fn writeVersionNegotiation(buf: []u8, dcid: []const u8, scid: []const u8) HeaderError!usize {
     if (dcid.len > 20 or scid.len > 20) return HeaderError.TooLarge;
     var pos: usize = 0;
@@ -367,4 +425,65 @@ test "version negotiation packet echoes ids and lists our versions" {
         @as(u32, @intFromEnum(Version.version2)),
         std.mem.readInt(u32, buf[21..25], .big),
     );
+}
+
+test "parses a real aioquic Version Negotiation packet" {
+    // Captured from aioquic 1.2.0: a v2-only server replying to an Initial
+    // whose version it does not speak. The first byte is 0xbd, so the Unused
+    // field is 0x3d -- aioquic greases it. RFC 9000 17.2.1 says clients MUST
+    // ignore that field, and a parser that looked at it would reject this.
+    const bytes = @embedFile("testdata/aioquic_version_negotiation.bin");
+    const vn = try parseVersionNegotiation(bytes);
+
+    // The IDs are echoed swapped: what we sent as source is the server's
+    // destination, and what we chose as destination is its source.
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xc2, 0xa0, 0x87, 0xf3, 0x42, 0x51, 0x74, 0x7a }, vn.dcid);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xdf, 0xc3, 0x7c, 0x2f, 0xb6, 0x84, 0x37, 0xab }, vn.scid);
+
+    try std.testing.expectEqual(@as(usize, 1), vn.count());
+    try std.testing.expectEqual(@as(u32, 0x6B3343CF), vn.versionAt(0));
+}
+
+test "rejects Version Negotiation packets that are not Version Negotiation" {
+    const vn = @embedFile("testdata/aioquic_version_negotiation.bin");
+
+    // Version field not zero: an ordinary long header, not VN.
+    var withVersion = @as([27]u8, vn[0..27].*);
+    withVersion[1] = 0x01;
+    try std.testing.expectError(HeaderError.InvalidPacket, parseVersionNegotiation(&withVersion));
+
+    // Header form clear: a short header packet.
+    var shortHeader = withVersion;
+    shortHeader[0] = 0x40;
+    try std.testing.expectError(HeaderError.InvalidPacket, parseVersionNegotiation(&shortHeader));
+
+    // Truncated before the second connection ID length byte.
+    try std.testing.expectError(HeaderError.Truncated, parseVersionNegotiation(vn[0..5]));
+
+    // Connection ID length above the 20-byte maximum of RFC 9000 section 17.2.
+    var longCid = @as([27]u8, vn[0..27].*);
+    longCid[5] = 21;
+    try std.testing.expectError(HeaderError.InvalidPacket, parseVersionNegotiation(&longCid));
+
+    // A version list that is not a whole number of 4-byte entries cannot
+    // have come from a conforming server, so it is malformed rather than
+    // something to skip past.
+    var partial: [28]u8 = undefined;
+    @memcpy(partial[0..27], vn[0..27]);
+    partial[27] = 0x00;
+    try std.testing.expectError(HeaderError.InvalidPacket, parseVersionNegotiation(&partial));
+
+    // No versions listed at all.
+    const none: [23]u8 = vn[0..23].*;
+    try std.testing.expectError(HeaderError.InvalidPacket, parseVersionNegotiation(&none));
+}
+
+test "reads every version in the list" {
+    // A server offering both, as this implementation's own writer does.
+    var buf: [64]u8 = undefined;
+    const n = try writeVersionNegotiation(&buf, "scid1234", "dcid5678");
+    const vn = try parseVersionNegotiation(buf[0..n]);
+    try std.testing.expectEqual(@as(usize, 2), vn.count());
+    try std.testing.expectEqual(@as(u32, 0x00000001), vn.versionAt(0));
+    try std.testing.expectEqual(@as(u32, 0x6B3343CF), vn.versionAt(1));
 }

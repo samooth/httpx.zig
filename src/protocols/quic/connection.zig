@@ -42,6 +42,10 @@ pub const Error = error{
     /// Peer transport parameters were missing, malformed, or
     /// inconsistent (RFC 9000 Section 7.4 / RFC 9001 Section 7.4).
     TransportParameterError,
+    /// A server sent Version Negotiation listing no version we speak
+    /// (RFC 9368 Section 2.1). The attempt is abandoned; retrying the
+    /// version we already offered would only loop.
+    VersionNegotiationFailed,
     /// Send window exhausted (connection or stream). Retry after the
     /// peer raises MAX_DATA / MAX_STREAM_DATA.
     SendBlocked,
@@ -279,6 +283,16 @@ pub const Connection = struct {
 
     // Transport parameters (peer's).
     peerParams: ?paramsMod.Params = null,
+    /// Version we first sent an Initial with (RFC 9368 section 1.2). A
+    /// Version Negotiation packet listing this version must be ignored: it
+    /// is the downgrade signal, and acting on it would let an off-path
+    /// attacker steer us to a version of their choosing.
+    originalVersion: u32 = 0x00000001,
+    /// Set once we have acted on a Version Negotiation packet. RFC 9368
+    /// section 4 forbids acting on a second one, and it also means the
+    /// server must authenticate the negotiated version during the
+    /// handshake, which is checked in the transport parameters.
+    versionNegotiated: bool = false,
 
     // Path MTU discovery (RFC 9000 section 14). `pathMtu` is the largest
     // UDP payload we believe the current path carries; probes raise it.
@@ -419,14 +433,12 @@ pub const Connection = struct {
     fn installInitialKeysFrom(self: *Connection, clientDcid: []const u8) Error!void {
         const secrets = crypto.initialSecrets(clientDcid, self.version) catch return Error.TlsDriverFailed;
         const sp = &self.spaces[0];
-        sp.keysTx = if (self.role == .client)
-            crypto.initialProtection(secrets, .client)
-        else
-            crypto.initialProtection(secrets, .server);
-        sp.keysRx = if (self.role == .client)
-            crypto.initialProtection(secrets, .server)
-        else
-            crypto.initialProtection(secrets, .client);
+        // The version selects the labels, not just the salt (RFC 9369
+        // section 3.3.2). Passing the version only as far as the salt left
+        // version 2 deriving a correct secret and keys nothing else could
+        // read.
+        sp.keysTx = crypto.initialProtectionForVersion(secrets, if (self.role == .client) .client else .server, self.version);
+        sp.keysRx = crypto.initialProtectionForVersion(secrets, if (self.role == .client) .server else .client, self.version);
     }
 
     /// Installs Handshake or 1-RTT keys provided by the TLS layer.
@@ -1078,7 +1090,8 @@ pub const Connection = struct {
             // padded datagram from a real client into a failed receive.
             if (first == 0) return;
             if ((first & 0x80) != 0 and std.mem.readInt(u32, slice[1..5], .big) == 0) {
-                return; // Version negotiation: policy handled above this layer.
+                try self.receiveVersionNegotiation(slice, nowMs);
+                return;
             }
             if ((first & 0x80) != 0) {
                 self.rxConsumed = 0;
@@ -1098,6 +1111,135 @@ pub const Connection = struct {
     /// tells the reply belongs to its own connection. Appended straight to
     /// the output buffer: a VN carries no frames and must go out even when
     /// the connection has nothing else to send.
+    /// Discards the first flight and restarts the handshake under a new
+    /// version (RFC 9368 section 2.1).
+    ///
+    /// Only what the version actually invalidates is reset. Flow control and
+    /// the congestion estimate are not, because neither depends on the wire
+    /// version and throwing away an RTT sample would cost more than it buys.
+    /// What does have to go: the packets we sent, which were protected under
+    /// the old salt and labels and cannot be retransmitted; the packet
+    /// numbers, which restart with a new connection; the Initial keys,
+    /// which are derived from the version's salt; and any early data, which
+    /// RFC 9369 section 5 scopes to the connection that issued it.
+    fn restartForNewVersion(self: *Connection, nowMs: u64) Error!void {
+        // 0-RTT keys and resumption material came from a connection under the
+        // previous version, and RFC 9368 section 7.2/7.3 do not carry either
+        // across one.
+        self.zeroRttKeysTx = null;
+        self.zeroRttKeysRx = null;
+        self.earlyDataAccepted = false;
+        self.earlyDataRejected = true;
+
+        for (&self.spaces) |*sp| {
+            sp.keysTx = null;
+            sp.keysRx = null;
+            sp.txSecret = null;
+            sp.rxSecret = null;
+            sp.txKeyPhase = false;
+            sp.rxKeyPhase = false;
+            sp.packetsInPhase = 0;
+            sp.nextPn = 0;
+            sp.largestAcked = null;
+            sp.highestRxPn = -1;
+            sp.inFlightBytes = 0;
+            sp.inFlightAckEliciting = 0;
+            sp.lastAckElicitingTsMs = null;
+            sp.ackedMax = null;
+            sp.lossTimeMs = null;
+            sp.ackQueued = false;
+            sp.ackElicitingCount = 0;
+            sp.ackDeadlineMs = null;
+            // Sent packets hold no owned frames, only the accounting that
+            // would make the peer believe they are still in flight.
+            sp.sent.clearRetainingCapacity();
+            for (sp.sentData.items) |d| self.allocator.free(d);
+            sp.sentData.clearRetainingCapacity();
+        }
+
+        // TLS has a transcript that describes an abandoned attempt.
+        for (&self.cryptoBuf) |*b| b.clearRetainingCapacity();
+        for (&self.cryptoRecvOff) |*o| o.* = 0;
+        for (&self.cryptoPending) |*q| {
+            for (q.items) |seg| self.allocator.free(seg.data);
+            q.clearRetainingCapacity();
+        }
+
+        self.installInitialKeys() catch return Error.TlsDriverFailed;
+        if (self.tls.start) |cb| try cb(self.tls.ctx, self, nowMs);
+    }
+
+    /// Acts on a Version Negotiation packet (RFC 9000 section 6.2,
+    /// RFC 9368 section 2.1).
+    ///
+    /// The packet is unauthenticated and unsourced, so almost every decision
+    /// here is about refusing it rather than acting on it. The checks, in
+    /// order:
+    ///
+    ///  - Servers ignore these outright; only a server sends them.
+    ///  - The two connection IDs must be the ones we sent, swapped. This is
+    ///    the only thing proving the sender saw our Initial.
+    ///  - Once any other packet has been processed we ignore it, so a VN
+    ///    arriving late cannot disturb a handshake already under way.
+    ///  - A VN listing our Original Version is ignored. That is the downgrade
+    ///    case: the server would be telling us the version we used is one it
+    ///    accepts, which means the packet is forged.
+    ///  - A second VN is ignored, for the same reason.
+    ///
+    /// Surviving all of that, we pick the best mutually supported version and
+    /// start again with it. The first flight is discarded: it was protected
+    /// under the old version's salt and labels, and packet numbers restart
+    /// because this is conceptually a new connection.
+    fn receiveVersionNegotiation(self: *Connection, dgram: []const u8, nowMs: u64) Error!void {
+        if (self.role != .client) return;
+        if (self.versionNegotiated) return;
+        if (self.state != .initial) return;
+        if (self.peerParams != null) return;
+
+        const vn = packetMod.parseVersionNegotiation(dgram) catch return;
+
+        // RFC 9000 section 17.2.1: the server echoes our source ID as its
+        // destination, and the destination we chose as its source.
+        if (!std.mem.eql(u8, vn.dcid, self.scid[0..self.scidLen])) return;
+        if (self.origDcidLen != 0 and !std.mem.eql(u8, vn.scid, self.origDcid[0..self.origDcidLen])) return;
+
+        // The downgrade signal. A server that speaks our Original Version
+        // has no reason to send this at all.
+        for (0..vn.count()) |i| {
+            if (vn.versionAt(i) == self.originalVersion) return;
+        }
+
+        const chosen = selectVersion(vn) orelse {
+            // RFC 9368 section 2.1: no mutually supported version means the
+            // attempt is over. Silently retrying the same version would just
+            // loop against a server that will never speak it.
+            return Error.VersionNegotiationFailed;
+        };
+
+        self.version = chosen;
+        self.versionNegotiated = true;
+        self.restartForNewVersion(nowMs) catch return Error.TlsDriverFailed;
+    }
+
+    /// Picks the best version from a Version Negotiation list.
+    ///
+    /// The server's order is not a preference order we may rely on -- RFC
+    /// 9368 section 3 says the ordering of Available Versions carries no
+    /// semantics -- so this walks our own preference and takes the first
+    /// version the server also lists. Reserving 0x?a?a?a?a is how a peer
+    /// checks that we ignore a value we cannot speak (RFC 9000 section 6.3);
+    /// `Version.isSupported` already excludes those, so they cannot be
+    /// selected here even if listed.
+    fn selectVersion(vn: packetMod.VersionNegotiation) ?u32 {
+        for ([_]u32{ 0x6B3343CF, 0x00000001 }) |ours| {
+            if (!packetMod.Version.isSupported(ours)) continue;
+            for (0..vn.count()) |i| {
+                if (vn.versionAt(i) == ours) return ours;
+            }
+        }
+        return null;
+    }
+
     fn sendVersionNegotiation(self: *Connection, dgram: []const u8) void {
         if (dgram.len < 6) return;
         const dcidLen = dgram[5];
@@ -1822,6 +1964,11 @@ pub const Connection = struct {
     /// Kicks off the handshake (client role only).
     pub fn startHandshake(self: *Connection, nowMs: u64) Error!void {
         if (self.role != .client) return;
+        // The version of our first flight is the Original Version
+        // (RFC 9368 section 1.2). Fixed here and never changed by a later
+        // negotiation, because a Version Negotiation packet listing it is
+        // exactly what a downgrade attempt looks like.
+        self.originalVersion = self.version;
         self.installInitialKeys() catch return Error.TlsDriverFailed;
         if (self.tls.start) |cb| try cb(self.tls.ctx, self, nowMs);
     }
@@ -3559,4 +3706,307 @@ test "the key update limit follows the negotiated cipher" {
         Connection.confidentialityLimit(.aes128Gcm) <
             Connection.confidentialityLimit(.chacha20Poly1305),
     );
+}
+
+/// Compares `got` against a hex literal. Only used where a failure needs to
+/// name the value: a wrong Initial key shows up at the peer as an AEAD
+/// failure with no indication which key was wrong.
+fn hexEq(got: []const u8, wantHex: []const u8) !void {
+    var want: [64]u8 = undefined;
+    _ = std.fmt.hexToBytes(&want, wantHex) catch return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, want[0..got.len], got);
+}
+
+/// Derives a client Initial packet protection key from the salt RFC 9369
+/// section 3.3.1 publishes and a HKDF-Expand-Label label, using std's HKDF
+/// directly rather than crypto.zig.
+///
+/// The point of not reusing crypto.zig is that the failure being guarded
+/// against here -- version 2 deriving keys under the version 1 labels -- is
+/// inside crypto.zig. A test that asked crypto.zig what it would do would
+/// agree with it even when it was wrong.
+fn initialKeyForTest(dcid: []const u8, comptime label: []const u8) ![16]u8 {
+    // RFC 9369 section 3.3.1.
+    const salt = [_]u8{
+        0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb,
+        0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb,
+        0xf9, 0xbd, 0x2e, 0xd9,
+    };
+    const initialSecret = std.crypto.kdf.hkdf.HkdfSha256.extract(&salt, dcid);
+    const clientInitialSecret = expandLabel(initialSecret, "client in", 32);
+    // The output length is part of the encoded info, so a 16-byte key does
+    // not derive from the same call as a 32-byte one.
+    const full = expandLabel(clientInitialSecret, label, 16);
+    var out: [16]u8 = undefined;
+    @memcpy(&out, full[0..16]);
+    return out;
+}
+
+/// One HKDF-Expand-Label step (RFC 8446 section 7.1). `label` is the bare
+/// label; the "tls13 " prefix is added here.
+fn expandLabel(secret: [32]u8, comptime label: []const u8, comptime outLen: u16) [32]u8 {
+    var info: [2 + 1 + 64 + 1]u8 = undefined;
+    const fullLabel = "tls13 " ++ label;
+    const infoLen = 2 + 1 + fullLabel.len + 1;
+    var w: usize = 0;
+    std.mem.writeInt(u16, info[0..2], outLen, .big);
+    w = 2;
+    info[w] = @intCast(fullLabel.len);
+    w += 1;
+    @memcpy(info[w..][0..fullLabel.len], fullLabel);
+    w += fullLabel.len;
+    info[w] = 0;
+    w += 1;
+    var out: [32]u8 = undefined;
+    std.crypto.kdf.hkdf.HkdfSha256.expand(&out, info[0..infoLen], secret);
+    return out;
+}
+
+/// A Version Negotiation packet built the way a server builds one: the
+/// client connection IDs echoed swapped, followed by the offered versions.
+/// `vnBytes` keeps the layout of a real capture so these tests exercise the
+/// same shape rather than a convenient one.
+fn buildVnForTest(
+    scid: []const u8,
+    origDcid: []const u8,
+    versions: []const u32,
+    buf: []u8,
+) !usize {
+    var pos: usize = 0;
+    buf[pos] = 0x80; // long header, Unused 0
+    pos += 1;
+    std.mem.writeInt(u32, buf[pos..][0..4], 0, .big);
+    pos += 4;
+    buf[pos] = @intCast(scid.len);
+    pos += 1;
+    @memcpy(buf[pos..][0..scid.len], scid);
+    pos += scid.len;
+    buf[pos] = @intCast(origDcid.len);
+    pos += 1;
+    @memcpy(buf[pos..][0..origDcid.len], origDcid);
+    pos += origDcid.len;
+    for (versions) |v| {
+        std.mem.writeInt(u32, buf[pos..][0..4], v, .big);
+        pos += 4;
+    }
+    return pos;
+}
+
+/// A client that has sent its first flight, with the Original Version set.
+fn vnClientForTest(a: Allocator) !*Connection {
+    const cli = try Connection.init(a, std.Io.Threaded.global_single_threaded.io(), .client, .{});
+    errdefer cli.deinit();
+    try cli.startHandshake(0);
+    return cli;
+}
+
+test "a client acts on a real aioquic Version Negotiation packet" {
+    const a = std.testing.allocator;
+    var cli = try vnClientForTest(a);
+    defer cli.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0x00000001), cli.version);
+
+    // Replayed verbatim: the capture below was produced by aioquic 1.2.0,
+    // so its layout, its greased Unused byte and its swapped connection IDs
+    // are the peer's, not ours. The client is given the IDs that capture
+    // echoes, which is what a real server would have seen.
+    const captured = @embedFile("testdata/aioquic_version_negotiation.bin");
+    const ids = try packetMod.parseVersionNegotiation(captured);
+    @memcpy(cli.scid[0..8], ids.dcid);
+    cli.scidLen = 8;
+    @memcpy(cli.dcid[0..8], ids.scid);
+    cli.dcidLen = 8;
+    @memcpy(cli.origDcid[0..8], ids.scid);
+    cli.origDcidLen = 8;
+
+    // Give the connection early data so that clearing it later means
+    // something. Resumption material and 0-RTT keys are scoped to the
+    // connection that obtained them and do not survive a version change
+    // (RFC 9368 sections 7.2 and 7.3).
+    const early = [_]u8{0x5C} ** 32;
+    cli.installZeroRttKeys(early, true);
+    cli.installZeroRttKeys(early, false);
+
+    try cli.receiveDatagram(captured, 10);
+
+    // The packet offers only v2.
+    try std.testing.expectEqual(@as(u32, 0x6B3343CF), cli.version);
+    try std.testing.expect(cli.versionNegotiated);
+    // The Original Version is deliberately not moved: it is what a forged
+    // packet is checked against.
+    try std.testing.expectEqual(@as(u32, 0x00000001), cli.originalVersion);
+
+    // Initial keys must be rederived under the new version's salt and
+    // labels, or every packet we send now fails AEAD validation at the peer.
+    // Expected here is derived from the salt RFC 9369 section 3.3.1 publishes,
+    // using std's HKDF directly rather than our own derivation. Going through
+    // crypto.zig would make this test agree with the code even when the code
+    // was wrong, which is the failure mode that let version 2 derive keys
+    // under the version 1 labels unnoticed.
+    const sp = &cli.spaces[0];
+    const want = try initialKeyForTest(cli.dcid[0..cli.dcidLen], "quicv2 key");
+    try std.testing.expectEqualSlices(u8, &want, sp.keysTx.?.key[0..16]);
+
+    // And it must not be what version 1 would have produced for the same
+    // connection ID.
+    const v1Key = try initialKeyForTest(cli.dcid[0..cli.dcidLen], "quic key");
+    try std.testing.expect(!std.mem.eql(u8, sp.keysTx.?.key[0..16], v1Key[0..]));
+
+    // 0-RTT does not cross a version boundary (RFC 9368 section 7.3).
+    try std.testing.expect(cli.zeroRttKeysTx == null);
+    try std.testing.expect(cli.zeroRttKeysRx == null);
+    try std.testing.expect(cli.earlyDataRejected);
+    try std.testing.expect(!cli.earlyDataAccepted);
+}
+
+test "Version Negotiation restarts the handshake rather than reusing it" {
+    const a = std.testing.allocator;
+    var cli = try vnClientForTest(a);
+    defer cli.deinit();
+
+    // Dirty the first flight: a packet in flight, an acknowledged stream
+    // offset, and buffered CRYPTO data from the abandoned attempt.
+    const sp = &cli.spaces[0];
+    sp.nextPn = 7;
+    sp.inFlightBytes = 1200;
+    sp.inFlightAckEliciting = 3;
+    sp.largestAcked = 6;
+    sp.highestRxPn = 42;
+    sp.ackElicitingCount = 2;
+    try sp.sent.append(a, .{ .pn = 6, .tsMs = 0, .inFlightBytes = 1200, .ackEliciting = true });
+    try sp.sentData.append(a, try a.dupe(u8, "discard me"));
+    try cli.cryptoBuf[0].appendSlice(a, "abandoned transcript");
+    cli.cryptoRecvOff[0] = 19;
+
+    var buf: [128]u8 = undefined;
+    const n = try buildVnForTest(cli.scid[0..cli.scidLen], cli.dcid[0..cli.dcidLen], &[_]u32{0x6B3343CF}, &buf);
+    try cli.receiveDatagram(buf[0..n], 10);
+
+    // A version switch is a new connection: packet numbers restart and
+    // nothing from the old flight is still counted as in flight.
+    try std.testing.expectEqual(@as(u64, 0), sp.nextPn);
+    try std.testing.expectEqual(@as(usize, 0), sp.inFlightBytes);
+    try std.testing.expectEqual(@as(u64, 0), sp.inFlightAckEliciting);
+    try std.testing.expectEqual(@as(i64, -1), sp.highestRxPn);
+    try std.testing.expectEqual(@as(u64, 0), sp.ackElicitingCount);
+    try std.testing.expect(sp.largestAcked == null);
+    try std.testing.expectEqual(@as(usize, 0), sp.sent.items.len);
+    try std.testing.expectEqual(@as(usize, 0), sp.sentData.items.len);
+
+    // The CRYPTO transcript of the abandoned attempt must not be fed to
+    // the new handshake, or the transcript hashes will not match.
+    try std.testing.expectEqual(@as(usize, 0), cli.cryptoBuf[0].items.len);
+    try std.testing.expectEqual(@as(u64, 0), cli.cryptoRecvOff[0]);
+}
+
+test "a Version Negotiation packet listing our own version is a downgrade attempt" {
+    const a = std.testing.allocator;
+    var cli = try vnClientForTest(a);
+    defer cli.deinit();
+
+    // We offered v1 and the packet lists v1. A real server that speaks the
+    // version we sent would not send this at all, so it cannot be trusted.
+    var buf: [128]u8 = undefined;
+    const n = try buildVnForTest(cli.scid[0..cli.scidLen], cli.dcid[0..cli.dcidLen], &[_]u32{ 0x00000001, 0x6B3343CF }, &buf);
+    try cli.receiveDatagram(buf[0..n], 10);
+
+    try std.testing.expectEqual(@as(u32, 0x00000001), cli.version);
+    try std.testing.expect(!cli.versionNegotiated);
+}
+
+test "a Version Negotiation packet echoing the wrong connection IDs is ignored" {
+    const a = std.testing.allocator;
+
+    // Wrong destination: the server did not echo the ID we sent as source.
+    {
+        var cli = try vnClientForTest(a);
+        defer cli.deinit();
+        var buf: [128]u8 = undefined;
+        const n = try buildVnForTest("not-ours", cli.dcid[0..cli.dcidLen], &[_]u32{0x6B3343CF}, &buf);
+        try cli.receiveDatagram(buf[0..n], 10);
+        try std.testing.expect(!cli.versionNegotiated);
+        try std.testing.expectEqual(@as(u32, 0x00000001), cli.version);
+    }
+
+    // Right destination, wrong source.
+    {
+        var cli = try vnClientForTest(a);
+        defer cli.deinit();
+        var buf: [128]u8 = undefined;
+        const n = try buildVnForTest(cli.scid[0..cli.scidLen], "bogus-dcid", &[_]u32{0x6B3343CF}, &buf);
+        try cli.receiveDatagram(buf[0..n], 10);
+        try std.testing.expect(!cli.versionNegotiated);
+    }
+}
+
+test "only one Version Negotiation packet is acted on" {
+    const a = std.testing.allocator;
+    var cli = try vnClientForTest(a);
+    defer cli.deinit();
+
+    // A second Version Negotiation packet must not restart the handshake
+    // again (RFC 9368 section 4). Asserted on the handshake restart itself
+    // rather than on the resulting version: with only two versions we speak,
+    // a second packet naming the other one is refused anyway by the
+    // downgrade rule, so checking the version could not tell the two rules
+    // apart.
+    var starts: usize = 0;
+    const S = struct {
+        fn cb(ctx: ?*anyopaque, conn: *Connection, nowMs: u64) Error!void {
+            _ = conn;
+            _ = nowMs;
+            const p: *usize = @ptrCast(@alignCast(ctx.?));
+            p.* += 1;
+        }
+    };
+    cli.tls.start = S.cb;
+    cli.tls.ctx = @ptrCast(&starts);
+
+    var buf: [128]u8 = undefined;
+    const n = try buildVnForTest(cli.scid[0..cli.scidLen], cli.dcid[0..cli.dcidLen], &[_]u32{0x6B3343CF}, &buf);
+    try cli.receiveDatagram(buf[0..n], 10);
+    try std.testing.expectEqual(@as(u32, 0x6B3343CF), cli.version);
+    try std.testing.expectEqual(@as(usize, 1), starts);
+
+    // A well-formed reply with the same connection IDs, offering the
+    // version we are already on.
+    const n2 = try buildVnForTest(cli.scid[0..cli.scidLen], cli.dcid[0..cli.dcidLen], &[_]u32{0x6B3343CF}, &buf);
+    try cli.receiveDatagram(buf[0..n2], 20);
+    try std.testing.expectEqual(@as(usize, 1), starts);
+    try std.testing.expectEqual(@as(u32, 0x6B3343CF), cli.version);
+}
+
+test "Version Negotiation listing nothing we speak ends the attempt" {
+    const a = std.testing.allocator;
+    var cli = try vnClientForTest(a);
+    defer cli.deinit();
+
+    // Reserved for exercising negotiation, plus a version we do not have.
+    var buf: [128]u8 = undefined;
+    const n = try buildVnForTest(cli.scid[0..cli.scidLen], cli.dcid[0..cli.dcidLen], &[_]u32{ 0x0a0a0a0a, 0xfaceb00c }, &buf);
+    try std.testing.expectError(Error.VersionNegotiationFailed, cli.receiveDatagram(buf[0..n], 10));
+}
+
+test "a server ignores Version Negotiation packets" {
+    const a = std.testing.allocator;
+    const srv = try Connection.init(a, std.Io.Threaded.global_single_threaded.io(), .server, .{});
+    defer srv.deinit();
+
+    var buf: [128]u8 = undefined;
+    const n = try buildVnForTest(srv.scid[0..srv.scidLen], srv.dcid[0..srv.dcidLen], &[_]u32{0x6B3343CF}, &buf);
+    try srv.receiveDatagram(buf[0..n], 10);
+    try std.testing.expect(!srv.versionNegotiated);
+    try std.testing.expectEqual(@as(u32, 0x00000001), srv.version);
+}
+
+test "reserved versions are never selected" {
+    // 0x?a?a?a?a is reserved to check that a peer ignores values it cannot
+    // speak (RFC 9000 section 6.3), so a list of them offers nothing.
+    const a = std.testing.allocator;
+    var cli = try vnClientForTest(a);
+    defer cli.deinit();
+    var buf: [128]u8 = undefined;
+    const n = try buildVnForTest(cli.scid[0..cli.scidLen], cli.dcid[0..cli.dcidLen], &[_]u32{ 0x1a2a3a4a, 0xdadadada }, &buf);
+    try std.testing.expectError(Error.VersionNegotiationFailed, cli.receiveDatagram(buf[0..n], 10));
 }
