@@ -78,10 +78,12 @@ IDs we issued (RFC 9000 section 5.3) before touching a key. Without that, a
 wrong addressing convention cannot be observed at all: the packets simply fail
 to decrypt, which looks like a cryptography problem.
 
-What is still missing is process. The live aioquic exchange runs from an
-external script rather than the opt-in suite, so a regression in the
-request/response path would not fail CI. The replayed captures cover the
-handshake; the HTTP/3 exchange does not.
+The process gap this section used to describe is closed. The live aioquic
+exchange is the test `interop: aioquic completes an HTTP/3 request against us`
+in the opt-in `HTTPX_INTEROP=1` suite, and CI installs aioquic and sets that
+variable, so a regression in the request/response path fails the build instead
+of waiting to be noticed by hand. It remains the one interop test that can skip
+on capability rather than version, since no runner ships aioquic.
 
 ## Open
 
