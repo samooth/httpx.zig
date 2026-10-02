@@ -176,6 +176,20 @@ pub const Driver = struct {
             try out.appendSlice(a, vb[0..n]);
             try out.appendSlice(a, conn.scid[0..conn.scidLen]);
         }
+        // Version Information (RFC 9368 section 3). A client's Available
+        // Versions lists every version its first flight is compatible with
+        // in descending preference and must include its Chosen Version;
+        // version 2 is compatible with version 1 (RFC 9369 section 4), so
+        // both are offered. A server lists the versions this deployment
+        // runs, in any order -- the ordering carries no semantics.
+        if (connMod.supportsVersionNegotiation()) {
+            const available = if (conn.role == .client)
+                paramsMod.preferredVersionsOrdered()
+            else
+                paramsMod.supportedVersionsUnordered();
+            try paramsMod.encodeVersionInformation(&out, a, conn.version, available);
+        }
+
         // originalDestinationConnectionId: servers echo the DCID the
         // client first used (already installed by acceptInitial).
         if (conn.role == .server) {
@@ -225,6 +239,12 @@ pub const Driver = struct {
         if (p.initialMaxStreamsBidi != 0) conn.maxStreamsBidiRemote = p.initialMaxStreamsBidi;
         if (p.initialMaxStreamsUni != 0) conn.maxStreamsUniRemote = p.initialMaxStreamsUni;
         if (p.maxAckDelayMs != 0) conn.recovery.cfg.maxAckDelayMs = p.maxAckDelayMs;
+        // Downgrade protection (RFC 9368 section 4). Runs before the values
+        // are recorded, so a peer failing this cannot have its limits used.
+        const peerVi = paramsMod.parseVersionInformation(tp) catch
+            return connMod.Error.TransportParameterError;
+        try conn.validatePeerVersionInfo(peerVi);
+
         conn.peerParams = p;
     }
 
@@ -1057,4 +1077,35 @@ test "live QUIC 0-RTT resumption over real udp loopback sends early data and est
         try std.testing.expect(srvConn.earlyDataAccepted);
         try std.testing.expect(cliConn.earlyDataAccepted);
     }
+}
+
+test "our transport parameters carry Version Information" {
+    const a = std.testing.allocator;
+    const cli = try Connection.init(a, std.Io.Threaded.global_single_threaded.io(), .client, .{});
+    defer cli.deinit();
+
+    const block = try Driver.buildLocalTransportParams(a, cli);
+    defer a.free(block);
+
+    // Absent, nothing is authenticated about the version and RFC 9369
+    // section 4 forbids that for an endpoint supporting version 2. This
+    // failed silently before: no test looked at what we send.
+    const vi = (try paramsMod.parseVersionInformation(block)).?;
+    try std.testing.expectEqual(@as(u32, cli.version), vi.chosen);
+    // A client must include its Chosen Version in its Available Versions.
+    try std.testing.expect(vi.offers(vi.chosen));
+    try std.testing.expect(vi.offers(0x6B3343CF));
+    try std.testing.expect(vi.offers(0x00000001));
+}
+
+test "a server also carries Version Information" {
+    const a = std.testing.allocator;
+    const srv = try Connection.init(a, std.Io.Threaded.global_single_threaded.io(), .server, .{});
+    defer srv.deinit();
+
+    const block = try Driver.buildLocalTransportParams(a, srv);
+    defer a.free(block);
+    const vi = (try paramsMod.parseVersionInformation(block)).?;
+    try std.testing.expectEqual(@as(u32, srv.version), vi.chosen);
+    try std.testing.expect(vi.offers(srv.version));
 }

@@ -173,6 +173,66 @@ pub const BuildInfo = struct {
 /// which is the whole reason the packet exists: without it a peer whose
 /// preferred version is unsupported gets silence instead of a negotiation
 /// it can act on.
+/// The versions we speak, in descending order of preference.
+///
+/// Version 2 is first because RFC 9369 section 2.5 tells a client to pick an
+/// Original Version most likely to be understood without a round trip. The
+/// order is also what RFC 9368 section 4 compares against: a client that
+/// reacted to a Version Negotiation packet checks that it would still have
+/// made this same choice knowing the server's Available Versions, which only
+/// holds if there is exactly one preference order in the code.
+pub const preferredVersions = [_]u32{ 0x6B3343CF, 0x00000001 };
+
+/// Picks the version we would use from a set a peer offered.
+///
+/// One rule, used in both places that need it: the choice made from an
+/// unauthenticated Version Negotiation packet, and the choice RFC 9368
+/// section 4 has the client re-derive from the authenticated Available
+/// Versions. Sharing it is the point -- if the two disagreed, a peer could
+/// satisfy the authenticated check with a list that implies a different
+/// version than the unauthenticated one accepted.
+///
+/// Nothing is excluded here. Refusing a packet that lists our Original
+/// Version is a separate check that runs before this, and the authenticated
+/// check deliberately does not exclude it: knowing the server supports the
+/// version we prefer is exactly the knowledge being tested.
+pub fn selectNegotiatedVersion(list: anytype) ?u32 {
+    for (preferredVersions) |ours| {
+        if (!Version.isSupported(ours)) continue;
+        for (0..list.len()) |i| {
+            if (list.at(i) == ours) return ours;
+        }
+    }
+    return null;
+}
+
+/// Version Negotiation packets as a list, for `selectNegotiatedVersion`.
+pub const VersionNegotiationList = struct {
+    vn: VersionNegotiation,
+
+    pub fn len(self: VersionNegotiationList) usize {
+        return self.vn.count();
+    }
+
+    pub fn at(self: VersionNegotiationList, i: usize) u32 {
+        return self.vn.versionAt(i);
+    }
+};
+
+/// A borrowed slice of versions, for `selectNegotiatedVersion`. Used for the
+/// authenticated check, where the list comes from transport parameters.
+pub const VersionSlice = struct {
+    items: []const u32,
+
+    pub fn len(self: VersionSlice) usize {
+        return self.items.len;
+    }
+
+    pub fn at(self: VersionSlice, i: usize) u32 {
+        return self.items[i];
+    }
+};
+
 /// Parsed Version Negotiation packet (RFC 9000 section 17.2.1).
 ///
 /// This is the one packet whose Version field is zero, so it is not

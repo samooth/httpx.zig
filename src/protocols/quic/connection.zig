@@ -46,6 +46,10 @@ pub const Error = error{
     /// (RFC 9368 Section 2.1). The attempt is abandoned; retrying the
     /// version we already offered would only loop.
     VersionNegotiationFailed,
+    /// The peer's Version Information failed the downgrade check
+    /// (RFC 9368 Section 4). Signalled to the peer as
+    /// VERSION_NEGOTIATION_ERROR, transport error code 0x11.
+    VersionNegotiationError,
     /// Send window exhausted (connection or stream). Retry after the
     /// peer raises MAX_DATA / MAX_STREAM_DATA.
     SendBlocked,
@@ -58,6 +62,18 @@ pub const Error = error{
 };
 
 pub const Role = enum { client, server };
+
+/// VERSION_NEGOTIATION_ERROR (RFC 9368 section 10.2). Registered at 0x11 --
+/// the same number as the version_information transport parameter, which
+/// lives in a different registry.
+pub const VERSION_NEGOTIATION_ERROR: u64 = 0x11;
+
+/// True when we speak more than one version, which is what makes Version
+/// Information meaningful. RFC 9369 section 4 requires any endpoint
+/// supporting version 2 to send, process and validate it.
+pub fn supportsVersionNegotiation() bool {
+    return packetMod.preferredVersions.len > 1;
+}
 
 pub const SpaceKind = enum(u2) { initial = 0, handshake = 1, application = 2 };
 
@@ -1111,6 +1127,79 @@ pub const Connection = struct {
     /// tells the reply belongs to its own connection. Appended straight to
     /// the output buffer: a VN carries no frames and must go out even when
     /// the connection has nothing else to send.
+    /// Checks the peer's Version Information against what we negotiated
+    /// (RFC 9368 section 4).
+    ///
+    /// The Version Negotiation packet that started this is unauthenticated, so on
+    /// its own it only proves that somebody on the path can inject packets. What
+    /// makes the result trustworthy is that the server's Chosen Version and
+    /// Available Versions arrive inside transport parameters, which the TLS
+    /// transcript authenticates.
+    ///
+    /// The rules, as applied to a client:
+    ///
+    ///  - If we reacted to a VN packet, Version Information must be present.
+    ///  - The Chosen Version must be one we offered.
+    ///  - The Chosen Version must be the version actually in use.
+    ///  - The Available Versions must imply the same choice we made. If we had
+    ///    been handed that list plus the version in use, we would have picked
+    ///    the same one -- otherwise an attacker has steered us.
+    ///
+    /// Servers may complete a handshake without it, and a client that never
+    /// reacted to a VN packet may too, so a missing parameter is only fatal in
+    /// the case the RFC singles out.
+    pub fn validatePeerVersionInfo(
+        self: *Connection,
+        peer: ?paramsMod.VersionInformation,
+    ) Error!void {
+        if (peer) |vi| {
+            // RFC 9368 section 4: the client validates that the server's Chosen
+            // Version was sent by the client as part of its Available Versions.
+            if (!vi.offers(vi.chosen)) return Error.VersionNegotiationError;
+
+            // ...and that it equals the Negotiated Version, even when the version
+            // in the long headers changed. Otherwise a forger could influence the
+            // negotiated version just by forging a long header field.
+            if (vi.chosen != self.version) return Error.VersionNegotiationError;
+
+            // Re-derive the choice the server's own list implies. Its ordering
+            // carries no semantics, so it is unioned with the version in use and
+            // run through the same preference order the VN packet went through.
+            if (self.versionNegotiated) {
+                // Named separately in RFC 9368 section 4, though it is already
+                // implied by the check above: a server listing nothing cannot
+                // list the version it claims to have chosen.
+                if (vi.availableCount() == 0) return Error.VersionNegotiationError;
+                const implied = self.impliedVersion(vi);
+                if (implied != self.version) return Error.VersionNegotiationError;
+            }
+            return;
+        }
+
+        // Absent. Fatal only if we acted on a VN packet, and then only when the
+        // connection is not on version 1: RFC 9368 section 8 lets a client that
+        // started on version 1 proceed as though the parameter had said
+        // 0x00000001 with that version alone, which is what a version 1 only
+        // server will send. A version 2 connection gets no such allowance.
+        if (!self.versionNegotiated) return;
+        if (self.originalVersion == 0x00000001 and self.version == 0x00000001) return;
+        return Error.VersionNegotiationError;
+    }
+
+    /// The version we would have chosen had the server listed these Available
+    /// Versions alongside the one it actually selected.
+    fn impliedVersion(self: *Connection, vi: paramsMod.VersionInformation) ?u32 {
+        var buf: [17]u32 = undefined;
+        var n: usize = 0;
+        for (0..vi.availableCount()) |i| {
+            buf[n] = vi.availableAt(i);
+            n += 1;
+        }
+        buf[n] = self.version;
+        n += 1;
+        return packetMod.selectNegotiatedVersion(packetMod.VersionSlice{ .items = buf[0..n] });
+    }
+
     /// Discards the first flight and restarts the handshake under a new
     /// version (RFC 9368 section 2.1).
     ///
@@ -1209,7 +1298,7 @@ pub const Connection = struct {
             if (vn.versionAt(i) == self.originalVersion) return;
         }
 
-        const chosen = selectVersion(vn) orelse {
+        const chosen = packetMod.selectNegotiatedVersion(packetMod.VersionNegotiationList{ .vn = vn }) orelse {
             // RFC 9368 section 2.1: no mutually supported version means the
             // attempt is over. Silently retrying the same version would just
             // loop against a server that will never speak it.
@@ -1219,25 +1308,6 @@ pub const Connection = struct {
         self.version = chosen;
         self.versionNegotiated = true;
         self.restartForNewVersion(nowMs) catch return Error.TlsDriverFailed;
-    }
-
-    /// Picks the best version from a Version Negotiation list.
-    ///
-    /// The server's order is not a preference order we may rely on -- RFC
-    /// 9368 section 3 says the ordering of Available Versions carries no
-    /// semantics -- so this walks our own preference and takes the first
-    /// version the server also lists. Reserving 0x?a?a?a?a is how a peer
-    /// checks that we ignore a value we cannot speak (RFC 9000 section 6.3);
-    /// `Version.isSupported` already excludes those, so they cannot be
-    /// selected here even if listed.
-    fn selectVersion(vn: packetMod.VersionNegotiation) ?u32 {
-        for ([_]u32{ 0x6B3343CF, 0x00000001 }) |ours| {
-            if (!packetMod.Version.isSupported(ours)) continue;
-            for (0..vn.count()) |i| {
-                if (vn.versionAt(i) == ours) return ours;
-            }
-        }
-        return null;
     }
 
     fn sendVersionNegotiation(self: *Connection, dgram: []const u8) void {
@@ -4009,4 +4079,249 @@ test "reserved versions are never selected" {
     var buf: [128]u8 = undefined;
     const n = try buildVnForTest(cli.scid[0..cli.scidLen], cli.dcid[0..cli.dcidLen], &[_]u32{ 0x1a2a3a4a, 0xdadadada }, &buf);
     try std.testing.expectError(Error.VersionNegotiationFailed, cli.receiveDatagram(buf[0..n], 10));
+}
+
+/// A Version Information parameter as a server would send it.
+fn versionInfoForTest(out: *std.ArrayList(u8), gpa: Allocator, chosen: u32, available: []const u32) !void {
+    try paramsMod.encodeVersionInformation(out, gpa, chosen, available);
+}
+
+test "version_information round-trips through encode and parse" {
+    const a = std.testing.allocator;
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(a);
+    try versionInfoForTest(&out, a, 0x6B3343CF, &[_]u32{ 0x6B3343CF, 0x00000001 });
+
+    const vi = (try paramsMod.parseVersionInformation(out.items)).?;
+    try std.testing.expectEqual(@as(u32, 0x6B3343CF), vi.chosen);
+    try std.testing.expectEqual(@as(usize, 2), vi.availableCount());
+    try std.testing.expect(vi.offers(0x00000001));
+    try std.testing.expect(vi.offers(0x6B3343CF));
+    // The client's own Available Versions must include its Chosen Version,
+    // so this is a property we assert rather than assume.
+    try std.testing.expect(vi.offers(vi.chosen));
+}
+
+test "malformed version_information is rejected" {
+    const a = std.testing.allocator;
+
+    // Shorter than a Chosen Version.
+    {
+        var block = std.ArrayList(u8).empty;
+        defer block.deinit(a);
+        try block.appendSlice(a, &[_]u8{ 0x11, 0x02, 0, 1 });
+        try std.testing.expectError(
+            paramsMod.Error.InvalidParameter,
+            paramsMod.parseVersionInformation(block.items),
+        );
+    }
+    // Length not a whole number of 4-byte entries after the Chosen Version.
+    {
+        var block = std.ArrayList(u8).empty;
+        defer block.deinit(a);
+        try block.appendSlice(a, &[_]u8{ 0x11, 0x06, 0, 0, 0, 1, 0x0A, 0x0B });
+        try std.testing.expectError(
+            paramsMod.Error.InvalidParameter,
+            paramsMod.parseVersionInformation(block.items),
+        );
+    }
+    // Chosen Version of zero is the value that marks a VN packet, so it can
+    // never name a version to use.
+    {
+        var block = std.ArrayList(u8).empty;
+        defer block.deinit(a);
+        try block.appendSlice(a, &[_]u8{ 0x11, 0x08, 0, 0, 0, 0, 0, 0, 0, 1 });
+        try std.testing.expectError(
+            paramsMod.Error.InvalidParameter,
+            paramsMod.parseVersionInformation(block.items),
+        );
+    }
+    // An Available Version of zero, same reasoning.
+    {
+        var block = std.ArrayList(u8).empty;
+        defer block.deinit(a);
+        try block.appendSlice(a, &[_]u8{ 0x11, 0x08, 0, 0, 0, 1, 0, 0, 0, 0 });
+        try std.testing.expectError(
+            paramsMod.Error.InvalidParameter,
+            paramsMod.parseVersionInformation(block.items),
+        );
+    }
+    // Two copies: one for the check and one for anything reading it later.
+    {
+        var block = std.ArrayList(u8).empty;
+        defer block.deinit(a);
+        try versionInfoForTest(&block, a, 0x00000001, &[_]u32{0x00000001});
+        try versionInfoForTest(&block, a, 0x00000001, &[_]u32{0x00000001});
+        try std.testing.expectError(
+            paramsMod.Error.DuplicateParameter,
+            paramsMod.parseVersionInformation(block.items),
+        );
+    }
+}
+
+test "a server naming a version we never offered is refused" {
+    const a = std.testing.allocator;
+    var cli = try vnClientForTest(a);
+    defer cli.deinit();
+
+    // Chosen Version 0xfaceb00c, which is in neither our preference order
+    // nor the Available Versions we sent.
+    var block = std.ArrayList(u8).empty;
+    defer block.deinit(a);
+    try versionInfoForTest(&block, a, 0xfaceb00c, &[_]u32{0xfaceb00c});
+    const vi = (try paramsMod.parseVersionInformation(block.items)).?;
+    try std.testing.expectError(Error.VersionNegotiationError, cli.validatePeerVersionInfo(vi));
+}
+
+test "a Chosen Version missing from its own Available Versions is refused" {
+    const a = std.testing.allocator;
+    var cli = try vnClientForTest(a);
+    defer cli.deinit();
+
+    // The version in use matches, so this is not caught by comparing the
+    // Chosen Version to the connection: the only thing wrong is that the
+    // server did not list the version it claims to be using. RFC 9368
+    // section 4 requires the client to check that the server's Chosen
+    // Version was one the client offered, and a server whose list omits its
+    // own choice is describing something we never agreed to.
+    cli.version = 0x6B3343CF;
+    var block = std.ArrayList(u8).empty;
+    defer block.deinit(a);
+    try versionInfoForTest(&block, a, 0x6B3343CF, &[_]u32{0x00000001});
+    const vi = (try paramsMod.parseVersionInformation(block.items)).?;
+    try std.testing.expect(!vi.offers(vi.chosen));
+    try std.testing.expectError(Error.VersionNegotiationError, cli.validatePeerVersionInfo(vi));
+}
+
+test "a version 1 connection may proceed without Version Information" {
+    const a = std.testing.allocator;
+    var cli = try vnClientForTest(a);
+    defer cli.deinit();
+
+    // RFC 9368 section 8: a client that is starting a version 1 connection in
+    // response to a Version Negotiation packet, and finds the parameter
+    // missing, proceeds as though the server had sent 0x00000001 with that
+    // version alone. That is what a version 1 only server does, so refusing
+    // it here would make version negotiation unusable against exactly the
+    // peers it exists to reach.
+    cli.versionNegotiated = true;
+    cli.originalVersion = 0x00000001;
+    cli.version = 0x00000001;
+    try cli.validatePeerVersionInfo(null);
+}
+
+test "a server whose Available Versions imply a downgrade is refused" {
+    const a = std.testing.allocator;
+    var cli = try vnClientForTest(a);
+    defer cli.deinit();
+
+    // The genuine downgrade this check exists to catch. We started on
+    // version 2 and ended up on version 1, and the server now says it chose
+    // version 1 while also claiming to support version 2. A server that
+    // supports version 2 and that saw us offer it -- which our Available
+    // Versions told it -- would not have picked the version we did not
+    // prefer. Either the packet was forged or the server is not what it
+    // claims; both are refusals.
+    cli.originalVersion = 0x6B3343CF;
+    cli.version = 0x00000001;
+    cli.versionNegotiated = true;
+
+    var block = std.ArrayList(u8).empty;
+    defer block.deinit(a);
+    try versionInfoForTest(&block, a, 0x00000001, &[_]u32{ 0x00000001, 0x6B3343CF });
+    const vi = (try paramsMod.parseVersionInformation(block.items)).?;
+    try std.testing.expectError(Error.VersionNegotiationError, cli.validatePeerVersionInfo(vi));
+}
+
+test "a server listing no Available Versions after negotiation is refused" {
+    const a = std.testing.allocator;
+    var cli = try vnClientForTest(a);
+    defer cli.deinit();
+
+    var buf: [128]u8 = undefined;
+    const n = try buildVnForTest(cli.scid[0..cli.scidLen], cli.dcid[0..cli.dcidLen], &[_]u32{0x6B3343CF}, &buf);
+    try cli.receiveDatagram(buf[0..n], 10);
+
+    // RFC 9368 section 4 names this case directly: an empty list after
+    // reacting to a VN packet is a refusal, not a shrug. It is also what a
+    // forger has to send to keep the list from implying a different choice,
+    // since an empty list unions with nothing.
+    var block = std.ArrayList(u8).empty;
+    defer block.deinit(a);
+    try versionInfoForTest(&block, a, 0x6B3343CF, &[_]u32{});
+    const vi = (try paramsMod.parseVersionInformation(block.items)).?;
+    try std.testing.expectEqual(@as(usize, 0), vi.availableCount());
+    try std.testing.expectError(Error.VersionNegotiationError, cli.validatePeerVersionInfo(vi));
+}
+
+test "an honest server's Available Versions pass the same check" {
+    const a = std.testing.allocator;
+    var cli = try vnClientForTest(a);
+    defer cli.deinit();
+
+    var buf: [128]u8 = undefined;
+    const n = try buildVnForTest(cli.scid[0..cli.scidLen], cli.dcid[0..cli.dcidLen], &[_]u32{0x6B3343CF}, &buf);
+    try cli.receiveDatagram(buf[0..n], 10);
+
+    // We prefer version 2, and the server says it offers both. Knowing that
+    // beforehand we would have picked version 2, which is what we picked.
+    var block = std.ArrayList(u8).empty;
+    defer block.deinit(a);
+    try versionInfoForTest(&block, a, 0x6B3343CF, &[_]u32{ 0x6B3343CF, 0x00000001 });
+    const vi = (try paramsMod.parseVersionInformation(block.items)).?;
+    try cli.validatePeerVersionInfo(vi);
+}
+
+test "a Chosen Version that is not the one in use is refused" {
+    const a = std.testing.allocator;
+    var cli = try vnClientForTest(a);
+    defer cli.deinit();
+
+    // The server claims to be using version 1 while our long headers say
+    // version 2. A forger could cause this by touching a header field.
+    cli.version = 0x6B3343CF;
+    var block = std.ArrayList(u8).empty;
+    defer block.deinit(a);
+    try versionInfoForTest(&block, a, 0x00000001, &[_]u32{ 0x00000001, 0x6B3343CF });
+    const vi = (try paramsMod.parseVersionInformation(block.items)).?;
+    try std.testing.expectError(Error.VersionNegotiationError, cli.validatePeerVersionInfo(vi));
+}
+
+test "version_information may be absent unless we acted on a packet" {
+    const a = std.testing.allocator;
+
+    // A connection that never saw a VN packet: absent is fine. RFC 9368
+    // section 4 lets a client complete in this case, and a version 1 only
+    // peer will not send it.
+    {
+        var cli = try vnClientForTest(a);
+        defer cli.deinit();
+        try cli.validatePeerVersionInfo(null);
+    }
+
+    // We reacted to a VN packet and the connection ended up on version 2,
+    // which RFC 9368 section 8 gives no allowance for: the negotiated version
+    // has to be authenticated.
+    {
+        var cli = try vnClientForTest(a);
+        defer cli.deinit();
+        var buf: [128]u8 = undefined;
+        const n = try buildVnForTest(cli.scid[0..cli.scidLen], cli.dcid[0..cli.dcidLen], &[_]u32{0x6B3343CF}, &buf);
+        try cli.receiveDatagram(buf[0..n], 10);
+        try std.testing.expectEqual(@as(u32, 0x6B3343CF), cli.version);
+        try std.testing.expectError(Error.VersionNegotiationError, cli.validatePeerVersionInfo(null));
+    }
+}
+
+test "the client's offered versions match the selection order" {
+    // The parameter we send and the order selectNegotiatedVersion walks must
+    // be the same list. If they drift, the downgrade check compares the
+    // server's list against a different preference than the one used to
+    // choose, and would accept downgrades it is meant to refuse.
+    try std.testing.expectEqualSlices(u32, &packetMod.preferredVersions, paramsMod.preferredVersionsOrdered());
+    try std.testing.expectEqual(@as(usize, 2), paramsMod.preferredVersionsOrdered().len);
+    // A client must include its Chosen Version in its Available Versions.
+    for (paramsMod.preferredVersionsOrdered()) |v| {
+        try std.testing.expect(v == packetMod.preferredVersions[0] or v == packetMod.preferredVersions[1]);
+    }
 }

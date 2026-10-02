@@ -34,6 +34,7 @@ pub const ParamId = enum(u64) {
     activeConnectionIdLimit = 0x0E,
     initialSourceConnectionId = 0x0F,
     retrySourceConnectionId = 0x10,
+    versionInformation = 0x11,
     _,
 };
 
@@ -217,6 +218,105 @@ pub fn decode(data: []const u8) Error!Params {
         pos += len;
     }
     return p;
+}
+
+/// Versions a client offers in Available Versions, in descending preference.
+/// This is `packet.preferredVersions`; it is repeated here so that emitting a
+/// parameter does not need the packet module, and the test asserts the two
+/// agree rather than trusting the duplication.
+pub fn preferredVersionsOrdered() []const u32 {
+    return &[_]u32{ 0x6B3343CF, 0x00000001 };
+}
+
+/// Versions a server offers in Available Versions. The ordering carries no
+/// semantics for a server (RFC 9368 section 3), so this is the supported set
+/// in wire order.
+pub fn supportedVersionsUnordered() []const u32 {
+    return &[_]u32{ 0x00000001, 0x6B3343CF };
+}
+
+/// Version Information (RFC 9368 section 3, transport parameter 0x11).
+///
+/// This is what makes version negotiation verifiable. A Version Negotiation
+/// packet is unauthenticated, so acting on one is only safe if the handshake
+/// later carries a Chosen Version that a forger could not have influenced.
+/// Until this is exchanged, the negotiated version rests on an off-path
+/// attacker being able to inject a packet.
+pub const VersionInformation = struct {
+    /// The version the sender is using for this connection.
+    chosen: u32,
+    /// Available Versions as raw 4-byte entries, borrowed from the block.
+    /// Not decoded to an array to match `VersionNegotiation` in packet.zig and
+    /// to keep `decode` allocation-free.
+    availableBytes: []const u8,
+
+    pub fn availableCount(self: VersionInformation) usize {
+        return self.availableBytes.len / 4;
+    }
+
+    pub fn availableAt(self: VersionInformation, i: usize) u32 {
+        return std.mem.readInt(u32, self.availableBytes[i * 4 ..][0..4], .big);
+    }
+
+    pub fn offers(self: VersionInformation, v: u32) bool {
+        for (0..self.availableCount()) |i| {
+            if (self.availableAt(i) == v) return true;
+        }
+        return false;
+    }
+};
+
+/// Extracts Version Information, validating the structure RFC 9368 section 4
+/// describes: too short, or a length that is not a whole number of 4-byte
+/// entries, is a parsing failure. A Chosen Version of zero, or any Available
+/// Version of zero, is also a parsing failure -- zero is what marks a Version
+/// Negotiation packet, so it can never name a version to use.
+pub fn parseVersionInformation(data: []const u8) Error!?VersionInformation {
+    var pos: usize = 0;
+    var found: ?VersionInformation = null;
+
+    while (pos < data.len) {
+        const idRaw = try dv(data, &pos);
+        const lenRaw = try dv(data, &pos);
+        const len = std.math.cast(usize, lenRaw) orelse return Error.InvalidParameter;
+        if (pos > data.len or len > data.len - pos) return Error.Truncated;
+
+        if (idRaw == @intFromEnum(ParamId.versionInformation)) {
+            // A second copy would let a peer send one Chosen Version for the
+            // check and another for anything that reads it later.
+            if (found != null) return Error.DuplicateParameter;
+            if (len < 4 or (len - 4) % 4 != 0) return Error.InvalidParameter;
+            const chosen = std.mem.readInt(u32, data[pos..][0..4], .big);
+            if (chosen == 0) return Error.InvalidParameter;
+            const available = data[pos + 4 ..][0 .. len - 4];
+            for (0..available.len / 4) |i| {
+                if (std.mem.readInt(u32, available[i * 4 ..][0..4], .big) == 0) {
+                    return Error.InvalidParameter;
+                }
+            }
+            found = .{ .chosen = chosen, .availableBytes = available };
+            pos += len;
+            continue;
+        }
+        pos += len;
+    }
+    return found;
+}
+
+/// Writes Version Information as parameter 0x11 (RFC 9368 section 3).
+pub fn encodeVersionInformation(
+    out: *std.ArrayList(u8),
+    gpa: Allocator,
+    chosen: u32,
+    available: []const u32,
+) !void {
+    var value: [4 + 4 * 16]u8 = undefined;
+    if (available.len > 16) return Error.InvalidParameter;
+    std.mem.writeInt(u32, value[0..4], chosen, .big);
+    for (available, 0..) |v, i| {
+        std.mem.writeInt(u32, value[4 + i * 4 ..][0..4], v, .big);
+    }
+    try putParam(out, gpa, @intFromEnum(ParamId.versionInformation), value[0 .. 4 + available.len * 4]);
 }
 
 /// Byte-carrying transport parameters (connection IDs and tokens),

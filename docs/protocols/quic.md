@@ -11,7 +11,7 @@ RFC 9000 defines QUIC, a secure, general-purpose, multiplexed transport protocol
 * **Key Update**: 1-RTT keys rotate on the confidentiality limit, and the peer phase is followed. See RFC 9001 section 6.
 * **Path MTU Discovery**: Sends are capped by what the peer advertised, and padded `PATH_CHALLENGE` probes raise the estimate. See RFC 9000 section 14.
 * **Connection Migration**: Connection IDs are issued so a peer can migrate, and a new address is validated before it is used. See RFC 9000 section 9.
-* **Version Negotiation**: Both directions. An unsupported version is answered rather than dropped, and an incoming VN is parsed, checked and acted on: the client switches to a mutually supported version and restarts its first flight. See RFC 9000 section 6 and RFC 9368.
+* **Version Negotiation**: An unsupported version is answered rather than dropped; an incoming VN is parsed, checked and acted on, switching the client to a mutually supported version; and the resulting version is authenticated during the handshake through the `version_information` transport parameter, so a forged VN cannot force a downgrade. See RFC 9000 section 6, RFC 9368 and RFC 9369.
 * **Retry**: Integrity-tagged Retry packets (`protect.zig`) for address validation.
 
 ## QUIC Packet Types
@@ -51,33 +51,28 @@ the request/response exchange does not.
 Written down so the gaps are visible rather than discovered. None of these are
 bugs in what is present; they are absent features.
 
-### Downgrade protection across the handshake (RFC 9368 section 4)
+### Compatible version negotiation (RFC 9368 section 2.3)
 
-Acting on an incoming VN is implemented: `packet.parseVersionNegotiation`
-parses it, and `receiveVersionNegotiation` decides whether to. A client that
-survives the checks switches version, rederives Initial keys, discards the
-first flight and restarts the handshake.
+Acting on an incoming Version Negotiation packet is implemented, and so is the
+authenticated check that makes it safe: `version_information`
+(transport parameter 0x11) carries the peer's Chosen Version and Available
+Versions inside transport parameters, which the TLS transcript authenticates.
 
-Two halves of the anti-downgrade mechanism are still absent:
+The client refuses a connection when the server's Chosen Version is one we
+never offered, when it disagrees with the version in use, or when the server's
+Available Versions imply a version we would not have chosen -- which is the
+case an attacker has to construct to force a downgrade. It also requires the
+parameter to be present whenever we acted on a VN packet, except on a
+connection that started and stayed on version 1, where RFC 9368 section 8
+allows a version 1 only server to omit it.
 
-* **`version_information` transport parameter (0x11).** RFC 9368 section 4
-  requires both endpoints to exchange a Chosen Version and an Available
-  Versions list during the handshake, and requires the client to close with
-  `VERSION_NEGOTIATION_ERROR` if a server that reacted to a VN omits it or
-  names a version the client would not have chosen. The parameter is parsed
-  and echoed only in the sense that we tolerate its absence; it is not
-  validated, and a server that sends a hostile Available Versions list is not
-  detected. Section 8 permits a client that started on version 1 to proceed
-  as though the list were `0x00000001` alone, so version 1 is unaffected --
-  a negotiated version 2 connection is not authenticated this way.
-* **Compatible version negotiation (section 2.3).** The server selects the
-  version by switching the long header version mid-handshake. We only handle
-  the incompatible form, which costs a round trip.
-
-What is implemented is not nothing: the checks that do not need the handshake
-are the ones an off-path attacker has to get past, and each is tested by
-reverting it. A forged VN is rejected on the echoed connection IDs, on the
-Original Version it lists, and because a second one is ignored.
+Still missing is the other half: the server never *selects* a version. RFC
+9369 section 4.1 has a server that can parse a client's first flight reply in
+another version, switching the long header Version field part-way through the
+handshake; we always answer in the version the client chose, so a client that
+prefers version 2 but sent version 1 costs a round trip instead of getting
+version 2. Compatible negotiation also needs the client to learn the negotiated
+version from the long header, which we do not act on.
 
 ### DPLPMTUD frames and ICMP feedback
 
