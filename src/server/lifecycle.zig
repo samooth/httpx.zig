@@ -1131,7 +1131,7 @@ pub const Server = struct {
 
         const ticketKeys = if (self.cfg.tls) |t| t.ticketKeys orelse tlsSessionMod.TicketKeys{ .current = [_]u8{0x5A} ** 32 } else tlsSessionMod.TicketKeys{ .current = [_]u8{0x5A} ** 32 };
 
-        var drv = quicHs.Driver.initServer(self.allocator, .{
+        var drv = quicHs.Driver.initServer(self.io, self.allocator, .{
             .certChainPem = certPem,
             .privateKeyPem = keyPem,
             .ticketKeys = ticketKeys,
