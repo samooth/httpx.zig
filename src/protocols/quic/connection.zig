@@ -80,6 +80,10 @@ pub const PnSpace = struct {
     rxSecret: ?[32]u8 = null,
     /// Packets encrypted under the current keys, counted to trigger update.
     packetsInPhase: u64 = 0,
+    /// Phase bit we put on outgoing 1-RTT packets, and the one we expect on
+    /// incoming ones. Kept separate because each side updates independently.
+    txKeyPhase: bool = false,
+    rxKeyPhase: bool = false,
     /// Highest received PN for duplicate suppression.
     highestRxPn: i64 = -1,
     gpa: Allocator,
@@ -160,6 +164,15 @@ pub const State = enum {
 pub const MAX_DATAGRAM = 1500;
 pub const MAX_PEER_CONNECTION_IDS = 16;
 const MAX_CRYPTO_SEGMENTS = 1024;
+
+/// Packets we may protect under one set of 1-RTT keys before rotating.
+///
+/// RFC 9001 section 6 ties the update to the AEAD confidentiality limit,
+/// which is what makes it mandatory rather than discretionary: at 2^21 packets
+/// AES-GCM starts to leak key-dependent information. The exact figure depends
+/// on the cipher, so it is stated once for the ciphers this build uses rather
+/// than implied to be universal.
+const KEY_UPDATE_LIMIT: u64 = 1 << 21;
 
 /// Floor on how often a PMTU probe may be sent. RFC 9000 ties probing to
 /// the PTO; a fixed interval keeps this state machine trivial.
@@ -437,7 +450,8 @@ pub const Connection = struct {
         sp.keysRx = crypto.deriveProtectionKeys(rxSecret);
         sp.txSecret = txSecret;
         sp.rxSecret = rxSecret;
-        sp.keyPhase = false;
+        sp.txKeyPhase = false;
+        sp.rxKeyPhase = false;
         sp.packetsInPhase = 0;
     }
 
@@ -453,7 +467,7 @@ pub const Connection = struct {
         const next = crypto.nextApplicationSecret(cur);
         sp.keysTx = crypto.deriveProtectionKeys(next);
         sp.txSecret = next;
-        sp.keyPhase = !sp.keyPhase;
+        sp.txKeyPhase = !sp.txKeyPhase;
         sp.packetsInPhase = 0;
     }
 
@@ -468,8 +482,11 @@ pub const Connection = struct {
         const next = crypto.nextApplicationSecret(cur);
         sp.keysRx = crypto.deriveProtectionKeys(next);
         sp.rxSecret = next;
-        sp.keyPhase = !sp.keyPhase;
-        sp.packetsInPhase = 0;
+        // Only the receive phase moves. The peer updating says nothing about
+        // when we update: each side rotates on its own confidentiality limit,
+        // and folding both into one field made a peer-initiated update flip
+        // the bit we put on outgoing packets, which the peer then drops.
+        sp.rxKeyPhase = !sp.rxKeyPhase;
         return true;
     }
 
@@ -740,7 +757,7 @@ pub const Connection = struct {
             }) catch return Error.BufferTooSmall
         else if (kind == .application)
             packetMod.writeShortHeader(buf[0..], .{
-                .keyPhase = sp.keyPhase,
+                .keyPhase = sp.txKeyPhase,
                 .dcid = self.dcid[0..self.dcidLen],
                 .pnLen = pnLen,
             }) catch return Error.BufferTooSmall
@@ -817,6 +834,21 @@ pub const Connection = struct {
             sp.lastAckElicitingTsMs = nowMs;
         }
         sp.nextPn += 1;
+
+        // RFC 9001 section 6: rotate before the AEAD confidentiality limit
+        // is reached, rather than when an application asks. Without this the
+        // phase bit never moved on its own and the limit that motivates the
+        // whole mechanism was never enforced.
+        if (kind == .application and !isZeroRtt) {
+            sp.packetsInPhase += 1;
+            if (sp.packetsInPhase >= KEY_UPDATE_LIMIT) {
+                // Best effort: with no application secret installed yet there is
+                // nothing to rotate, so drop the counter rather than spin.
+                self.initiateKeyUpdate() catch {
+                    sp.packetsInPhase = 0;
+                };
+            }
+        }
     }
 
     /// True when the built payload carries anything beyond ACK, PADDING,
@@ -1415,12 +1447,12 @@ pub const Connection = struct {
 
         var pt: [MAX_DATAGRAM]u8 = undefined;
 
-        if (peer_phase != sp.keyPhase) {
+        if (peer_phase != sp.rxKeyPhase) {
             // The peer updated ahead of us. Try its phase; if those keys do
             // not open the packet then it was our own phase, late.
             const prev_keys = sp.keysRx;
             const prev_secret = sp.rxSecret;
-            const prev_phase = sp.keyPhase;
+            const prev_phase = sp.rxKeyPhase;
             _ = self.advanceRxKeyPhase();
             const trial = sp.keysRx.?;
             var opened = false;
@@ -1434,7 +1466,7 @@ pub const Connection = struct {
                 // decrypt, which is why they are not simply discarded.
                 sp.keysRx = prev_keys;
                 sp.rxSecret = prev_secret;
-                sp.keyPhase = prev_phase;
+                sp.rxKeyPhase = prev_phase;
                 protect.openWithKeys(pt[0..ctLen], work[aadLen..][0..ctLen], work[aadLen + ctLen ..][0..16].*, work[0..aadLen], keys, pn) catch
                     return Error.AuthenticationFailed;
             }
@@ -3086,7 +3118,7 @@ test "key update rotates 1-RTT keys and the peer follows the phase" {
     try srv.installKeys(.application, rx, tx);
 
     // Both sides start in phase 0 with the keys they were installed with.
-    try std.testing.expect(!cli.spaces[2].keyPhase);
+    try std.testing.expect(!cli.spaces[2].txKeyPhase);
     try std.testing.expectEqualSlices(u8, &tx, &cli.spaces[2].txSecret.?);
 
     // Rotating advances the secret with "quic ku", changes the derived keys,
@@ -3098,18 +3130,18 @@ test "key update rotates 1-RTT keys and the peer follows the phase" {
     try std.testing.expect(!std.mem.eql(u8, &before, &after));
     try std.testing.expectEqualSlices(u8, &crypto.nextApplicationSecret(before), after[0..]);
     try std.testing.expect(!std.mem.eql(u8, before_key[0..16], cli.spaces[2].keysTx.?.key[0..16]));
-    try std.testing.expect(cli.spaces[2].keyPhase);
+    try std.testing.expect(cli.spaces[2].txKeyPhase);
 
     // The receiver, still in phase 0, advances to meet it.
-    try std.testing.expect(!srv.spaces[2].keyPhase);
+    try std.testing.expect(!srv.spaces[2].rxKeyPhase);
     try std.testing.expect(srv.advanceRxKeyPhase());
-    try std.testing.expect(srv.spaces[2].keyPhase);
+    try std.testing.expect(srv.spaces[2].rxKeyPhase);
     // Both ends now hold the same 1-RTT secret, from opposite directions.
     try std.testing.expectEqualSlices(u8, &cli.spaces[2].txSecret.?, &srv.spaces[2].rxSecret.?);
 
     // A second update returns to phase 0 and a further secret.
     try cli.initiateKeyUpdate();
-    try std.testing.expect(!cli.spaces[2].keyPhase);
+    try std.testing.expect(!cli.spaces[2].txKeyPhase);
     try std.testing.expect(!std.mem.eql(u8, &after, &cli.spaces[2].txSecret.?));
 }
 
@@ -3139,7 +3171,7 @@ test "a reordered packet from the previous key phase still decrypts" {
     // The peer updates, so the held packet is now from the "wrong" phase.
     try cli.initiateKeyUpdate();
     _ = srv.advanceRxKeyPhase();
-    try std.testing.expect(srv.spaces[2].keyPhase);
+    try std.testing.expect(srv.spaces[2].rxKeyPhase);
 
     // Replaying it must not be dropped: the receive path falls back to the
     // previous keys when the candidate phase does not open the packet.
@@ -3435,4 +3467,64 @@ test "replay aioquic second flight: initial ack, handshake finished, 1rtt" {
     };
     // The ACK has to have been recorded for the space to have made progress.
     try std.testing.expect(srv.spaces[0].highestRxPn >= 1);
+}
+
+test "a peer-initiated key update does not move our transmit phase" {
+    const a = std.testing.allocator;
+    var cli = try Connection.init(a, std.Io.Threaded.global_single_threaded.io(), .client, .{});
+    defer cli.deinit();
+    var srv = try Connection.init(a, std.Io.Threaded.global_single_threaded.io(), .server, .{});
+    defer srv.deinit();
+    try cli.installKeys(.application, @splat(0xA1), @splat(0xB2));
+    try srv.installKeys(.application, @splat(0xB2), @splat(0xA1));
+
+    // We have not updated; our outgoing phase bit is 0.
+    try std.testing.expect(!cli.spaces[2].txKeyPhase);
+
+    // The peer updates. Only its receive side may move.
+    try std.testing.expect(srv.advanceRxKeyPhase());
+    try std.testing.expect(srv.spaces[2].rxKeyPhase);
+    try std.testing.expect(!srv.spaces[2].txKeyPhase);
+
+    // Our transmit bit is untouched, because each side rotates on its own
+    // limit and a peer update says nothing about ours. Folding both phases
+    // into one field made this flip and the peer dropped our packets.
+    try std.testing.expect(!cli.spaces[2].txKeyPhase);
+    try std.testing.expect(!cli.spaces[2].rxKeyPhase);
+
+    // Our own update moves only ours, and the two ends stay independent.
+    try cli.initiateKeyUpdate();
+    try std.testing.expect(cli.spaces[2].txKeyPhase);
+    try std.testing.expect(!cli.spaces[2].rxKeyPhase);
+    try std.testing.expect(srv.spaces[2].rxKeyPhase);
+    try std.testing.expect(!srv.spaces[2].txKeyPhase);
+}
+
+test "1-RTT keys rotate on their own once the confidentiality limit is reached" {
+    const a = std.testing.allocator;
+    var cli = try Connection.init(a, std.Io.Threaded.global_single_threaded.io(), .client, .{});
+    defer cli.deinit();
+    try cli.installKeys(.application, @splat(0xA1), @splat(0xB2));
+
+    const sp = &cli.spaces[@intFromEnum(SpaceKind.application)];
+    var first_secret = sp.txSecret.?;
+    try std.testing.expect(!sp.txKeyPhase);
+
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(a);
+    frames.encode(&payload, a, .ping) catch return;
+
+    // One short of the limit: the packet below it does not rotate.
+    sp.packetsInPhase = KEY_UPDATE_LIMIT - 2;
+    try cli.packetize(.application, &payload, 100);
+    try std.testing.expectEqual(@as(u64, KEY_UPDATE_LIMIT - 1), sp.packetsInPhase);
+    try std.testing.expect(!sp.txKeyPhase);
+    try std.testing.expectEqualSlices(u8, &first_secret, &sp.txSecret.?);
+
+    // Reaching it rotates by itself, with no application involvement. The
+    // count resets, so the budget starts again under the new keys.
+    try cli.packetize(.application, &payload, 200);
+    try std.testing.expect(sp.txKeyPhase);
+    try std.testing.expect(!std.mem.eql(u8, &first_secret, &sp.txSecret.?));
+    try std.testing.expectEqual(@as(u64, 0), sp.packetsInPhase);
 }
