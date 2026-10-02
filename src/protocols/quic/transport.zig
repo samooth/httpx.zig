@@ -391,13 +391,13 @@ test "fromEqual distinguishes address, port and address family" {
     const base: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 1 }, .port = 4433 } };
     try std.testing.expect(Endpoint.fromEqual(base, base));
 
-    var other_port = base;
-    other_port.ip4.port = 4434;
-    try std.testing.expect(!Endpoint.fromEqual(base, other_port));
+    var otherPort = base;
+    otherPort.ip4.port = 4434;
+    try std.testing.expect(!Endpoint.fromEqual(base, otherPort));
 
-    var other_host = base;
-    other_host.ip4.bytes = .{ 10, 0, 0, 2 };
-    try std.testing.expect(!Endpoint.fromEqual(base, other_host));
+    var otherHost = base;
+    otherHost.ip4.bytes = .{ 10, 0, 0, 2 };
+    try std.testing.expect(!Endpoint.fromEqual(base, otherHost));
 
     // A v4-mapped address is not the same endpoint as the v4 one.
     var v6bytes: [16]u8 = @splat(0);

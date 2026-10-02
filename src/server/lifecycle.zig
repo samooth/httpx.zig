@@ -113,8 +113,8 @@ pub const PortStrategy = enum {
 /// `curl` offer `h2`, and the exchange dies right after the handshake. The
 /// list has to come from what is implemented, not from what the config
 /// declares.
-const alpn_http11 = [_]alpnMod.Protocol{.@"http/1.1"};
-const alpn_http10_http11 = [_]alpnMod.Protocol{ .@"http/1.1", .@"http/1.0" };
+const alpnHttp11 = [_]alpnMod.Protocol{.@"http/1.1"};
+const alpnHttp10Http11 = [_]alpnMod.Protocol{ .@"http/1.1", .@"http/1.0" };
 
 pub const Config = struct {
     host: []const u8 = "0.0.0.0",
@@ -352,7 +352,7 @@ pub const Server = struct {
         // caller's decision, including a deliberate `h2`.
         if (effectiveCfg.tls) |*tcfg| {
             if (std.mem.eql(alpnMod.Protocol, tcfg.alpn, &alpnMod.DEFAULT_TCP_PREFERENCE)) {
-                tcfg.alpn = if (effectiveCfg.http10) &alpn_http10_http11 else &alpn_http11;
+                tcfg.alpn = if (effectiveCfg.http10) &alpnHttp10Http11 else &alpnHttp11;
             }
         }
 
@@ -372,7 +372,7 @@ pub const Server = struct {
             templateEngine = eng;
         }
 
-        var tlsServer_opt: ?tlsServerMod.Server = null;
+        var tlsServerOpt: ?tlsServerMod.Server = null;
         var loadedCertPem: ?[]const u8 = null;
         var loadedKeyPem: ?[]const u8 = null;
 
@@ -396,14 +396,14 @@ pub const Server = struct {
                         tCfg.privateKeyPem = loadedKeyPem.?;
                         // Identity problems surface here at startup; a
                         // failure leaves TLS disabled (historical leniency).
-                        tlsServer_opt = tlsServerMod.Server.init(allocator, io, tCfg.*) catch null;
+                        tlsServerOpt = tlsServerMod.Server.init(allocator, io, tCfg.*) catch null;
                     }
                 }
             }
         }
 
-        var h3Ep_opt: ?quicTransport.Endpoint = null;
-        var h3Placeholder_opt: ?*quicConn.Connection = null;
+        var h3EpOpt: ?quicTransport.Endpoint = null;
+        var h3PlaceholderOpt: ?*quicConn.Connection = null;
         if (effectiveCfg.http3 and loadedCertPem != null and loadedKeyPem != null) {
             const placeholder = try quicConn.Connection.init(allocator, io, .server, .{});
             errdefer placeholder.deinit();
@@ -411,8 +411,8 @@ pub const Server = struct {
                 placeholder.deinit();
                 return err;
             };
-            h3Ep_opt = ep;
-            h3Placeholder_opt = placeholder;
+            h3EpOpt = ep;
+            h3PlaceholderOpt = placeholder;
         }
 
         var srv = Server{
@@ -425,11 +425,11 @@ pub const Server = struct {
             .ownsIo = ownsIo,
             .ioThreaded = ioThreaded,
             .templateEngine = templateEngine,
-            .tlsServer = tlsServer_opt,
+            .tlsServer = tlsServerOpt,
             .tlsCertPemLoaded = loadedCertPem,
             .tlsKeyPemLoaded = loadedKeyPem,
-            .h3Endpoint = h3Ep_opt,
-            .h3PlaceholderConn = h3Placeholder_opt,
+            .h3Endpoint = h3EpOpt,
+            .h3PlaceholderConn = h3PlaceholderOpt,
             .h3Pump = null,
             .startTimeMs = clock.millisNow(),
         };
@@ -445,10 +445,10 @@ pub const Server = struct {
                 std.crypto.secureZero(u8, @constCast(k));
                 allocator.free(k);
             }
-            if (h3Ep_opt) |*ep| {
+            if (h3EpOpt) |*ep| {
                 ep.deinit();
             }
-            if (h3Placeholder_opt) |p| {
+            if (h3PlaceholderOpt) |p| {
                 p.deinit();
             }
         }

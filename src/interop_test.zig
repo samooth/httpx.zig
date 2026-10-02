@@ -21,12 +21,12 @@ const builtin = @import("builtin");
 const httpx = @import("httpx.zig");
 const clock = @import("common/clock.zig");
 
-const interop_cert = @embedFile("protocols/tls/testdata/localhostCert.pem");
-const interop_key = @embedFile("protocols/tls/testdata/localhostKey.pem");
+const interopCert = @embedFile("protocols/tls/testdata/localhostCert.pem");
+const interopKey = @embedFile("protocols/tls/testdata/localhostKey.pem");
 
 /// The hybrid group the post-quantum port offers. OpenSSL spells it exactly
 /// this way, and it is also the name we send in the key share.
-const hybrid_group = "X25519MLKEM768";
+const hybridGroup = "X25519MLKEM768";
 
 fn interopEnabled() bool {
     if (builtin.os.tag == .windows) return false;
@@ -62,24 +62,24 @@ fn opensslKnowsGroup(alloc: std.mem.Allocator, io: std.Io, group: []const u8) bo
 /// concatenated. Never rejects on a non-zero exit: a failing client is a
 /// result to assert on, not an error in the test.
 fn runClient(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8, input: ?[]const u8) ![]u8 {
-    const stdin_path = ".httpx-interop-stdin";
-    var stdin_file: ?std.Io.File = null;
+    const stdinPath = ".httpx-interop-stdin";
+    var stdinFile: ?std.Io.File = null;
     if (input) |text| {
         {
-            var tmp = try std.Io.Dir.cwd().createFile(io, stdin_path, .{});
+            var tmp = try std.Io.Dir.cwd().createFile(io, stdinPath, .{});
             defer tmp.close(io);
             try tmp.writeStreamingAll(io, text);
         }
-        stdin_file = try std.Io.Dir.cwd().openFile(io, stdin_path, .{});
+        stdinFile = try std.Io.Dir.cwd().openFile(io, stdinPath, .{});
     }
     defer {
-        if (stdin_file) |f| f.close(io);
-        std.Io.Dir.cwd().deleteFile(io, stdin_path) catch {};
+        if (stdinFile) |f| f.close(io);
+        std.Io.Dir.cwd().deleteFile(io, stdinPath) catch {};
     }
 
     var child = try std.process.spawn(io, .{
         .argv = argv,
-        .stdin = if (stdin_file) |f| .{ .file = f } else .ignore,
+        .stdin = if (stdinFile) |f| .{ .file = f } else .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
     });
@@ -123,7 +123,7 @@ const Harness = struct {
             .enableDocs = false,
             .logging = .{},
             .tls = if (use_tls)
-                .{ .certificatePem = interop_cert, .privateKeyPem = interop_key }
+                .{ .certificatePem = interopCert, .privateKeyPem = interopKey }
             else
                 null,
         });
@@ -156,7 +156,7 @@ const Harness = struct {
             .enableDocs = false,
             .logging = .{},
             .httpVersion = .http3,
-            .tls = .{ .certificatePem = interop_cert, .privateKeyPem = interop_key },
+            .tls = .{ .certificatePem = interopCert, .privateKeyPem = interopKey },
         });
         errdefer server.deinit();
         try server.get("/ping", helloHandler);
@@ -207,13 +207,13 @@ test "interop: openssl s_client completes a TLS 1.3 handshake with us" {
 
     // The test cert is self-signed, so it doubles as its own trust anchor.
     // Verifying against it is what makes "Verification: OK" mean something.
-    const ca_path = ".httpx-interop-ca.pem";
+    const caPath = ".httpx-interop-ca.pem";
     {
-        var f = try std.Io.Dir.cwd().createFile(io, ca_path, .{});
+        var f = try std.Io.Dir.cwd().createFile(io, caPath, .{});
         defer f.close(io);
-        try f.writeStreamingAll(io, interop_cert);
+        try f.writeStreamingAll(io, interopCert);
     }
-    defer std.Io.Dir.cwd().deleteFile(io, ca_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, caPath) catch {};
 
     var h = try Harness.start(a, io, true);
     defer h.stop(a);
@@ -223,7 +223,7 @@ test "interop: openssl s_client completes a TLS 1.3 handshake with us" {
     const out = try runClient(a, io, &.{
         "openssl",  "s_client",
         "-connect", addr,
-        "-CAfile",  ca_path,
+        "-CAfile",  caPath,
         "-alpn",    "http/1.1",
         "-verify",  "1",
         "-brief",   "-no_ign_eof",
@@ -279,18 +279,18 @@ test "interop: OpenSSL negotiates the post-quantum hybrid group" {
     // to find out. Where the group is missing the post-quantum path is
     // untestable rather than broken, and skipping says exactly that -- it
     // failed the run before by not being detected.
-    if (!opensslKnowsGroup(a, io, hybrid_group)) {
-        std.debug.print("\n---OPENSSL-HYBRID (openssl lacks {s})---\n---END---\n", .{hybrid_group});
+    if (!opensslKnowsGroup(a, io, hybridGroup)) {
+        std.debug.print("\n---OPENSSL-HYBRID (openssl lacks {s})---\n---END---\n", .{hybridGroup});
         return error.SkipZigTest;
     }
 
-    const ca_path = ".httpx-interop-ca.pem";
+    const caPath = ".httpx-interop-ca.pem";
     {
-        var f = try std.Io.Dir.cwd().createFile(io, ca_path, .{});
+        var f = try std.Io.Dir.cwd().createFile(io, caPath, .{});
         defer f.close(io);
-        try f.writeStreamingAll(io, interop_cert);
+        try f.writeStreamingAll(io, interopCert);
     }
-    defer std.Io.Dir.cwd().deleteFile(io, ca_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, caPath) catch {};
 
     var h = try Harness.start(a, io, true);
     defer h.stop(a);
@@ -303,14 +303,14 @@ test "interop: OpenSSL negotiates the post-quantum hybrid group" {
     const out = try runClient(a, io, &.{
         "openssl",  "s_client",
         "-connect", addr,
-        "-CAfile",  ca_path,
-        "-groups",  hybrid_group,
+        "-CAfile",  caPath,
+        "-groups",  hybridGroup,
         "-brief",
     }, null);
     defer a.free(out);
 
     std.debug.print("\n---OPENSSL-HYBRID---\n{s}\n---END---\n", .{out});
-    try std.testing.expect(std.mem.indexOf(u8, out, hybrid_group) != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, hybridGroup) != null);
     // `-brief` reports the result as `Verification: OK`, not the long form.
     try std.testing.expect(std.mem.indexOf(u8, out, "Verification: OK") != null);
 }
@@ -331,23 +331,23 @@ const OpenSslServer = struct {
     out_path: []const u8,
     reaped: bool = false,
 
-    const cert_file = ".httpx-interop-sserver-cert.pem";
-    const key_file = ".httpx-interop-sserver-key.pem";
-    const log_file = ".httpx-interop-sserver.log";
+    const certFile = ".httpx-interop-sserver-cert.pem";
+    const keyFile = ".httpx-interop-sserver-key.pem";
+    const logFile = ".httpx-interop-sserver.log";
 
     fn start(alloc: std.mem.Allocator, io: std.Io, group: ?[]const u8) !OpenSslServer {
         {
-            var f = try std.Io.Dir.cwd().createFile(io, cert_file, .{});
+            var f = try std.Io.Dir.cwd().createFile(io, certFile, .{});
             defer f.close(io);
-            try f.writeStreamingAll(io, interop_cert);
+            try f.writeStreamingAll(io, interopCert);
         }
         {
-            var f = try std.Io.Dir.cwd().createFile(io, key_file, .{});
+            var f = try std.Io.Dir.cwd().createFile(io, keyFile, .{});
             defer f.close(io);
-            try f.writeStreamingAll(io, interop_key);
+            try f.writeStreamingAll(io, interopKey);
         }
-        errdefer std.Io.Dir.cwd().deleteFile(io, cert_file) catch {};
-        errdefer std.Io.Dir.cwd().deleteFile(io, key_file) catch {};
+        errdefer std.Io.Dir.cwd().deleteFile(io, certFile) catch {};
+        errdefer std.Io.Dir.cwd().deleteFile(io, keyFile) catch {};
 
         // Ask the OS for a free port, then hand it to OpenSSL. A listener
         // bound to :0 is the only way to learn a port that is actually free;
@@ -367,9 +367,9 @@ const OpenSslServer = struct {
         try argv.append(alloc, "-accept");
         try argv.append(alloc, accept);
         try argv.append(alloc, "-cert");
-        try argv.append(alloc, cert_file);
+        try argv.append(alloc, certFile);
         try argv.append(alloc, "-key");
-        try argv.append(alloc, key_file);
+        try argv.append(alloc, keyFile);
         if (group) |g| {
             try argv.append(alloc, "-groups");
             try argv.append(alloc, g);
@@ -388,7 +388,7 @@ const OpenSslServer = struct {
         // test body and is terminated, not shut down politely, so draining a
         // pipe to EOF first would block forever and killing first would close
         // the pipe unread. A file has neither problem: read it after the kill.
-        const log = try std.Io.Dir.cwd().createFile(io, log_file, .{});
+        const log = try std.Io.Dir.cwd().createFile(io, logFile, .{});
         defer log.close(io);
 
         var child = try std.process.spawn(io, .{
@@ -402,9 +402,9 @@ const OpenSslServer = struct {
         var self: OpenSslServer = .{
             .child = child,
             .port = port,
-            .cert_path = cert_file,
-            .key_path = key_file,
-            .out_path = log_file,
+            .cert_path = certFile,
+            .key_path = keyFile,
+            .out_path = logFile,
         };
         try self.waitUntilListening(io);
         return self;
@@ -476,12 +476,12 @@ test "interop: our client completes a post-quantum handshake with openssl s_serv
     const a = std.testing.allocator;
     const io = std.testing.io;
 
-    if (!opensslKnowsGroup(a, io, hybrid_group)) {
-        std.debug.print("\n---OPENSSL-SSERVER-HYBRID (openssl lacks {s})---\n---END---\n", .{hybrid_group});
+    if (!opensslKnowsGroup(a, io, hybridGroup)) {
+        std.debug.print("\n---OPENSSL-SSERVER-HYBRID (openssl lacks {s})---\n---END---\n", .{hybridGroup});
         return error.SkipZigTest;
     }
 
-    var srv = try OpenSslServer.start(a, io, hybrid_group);
+    var srv = try OpenSslServer.start(a, io, hybridGroup);
     defer srv.deinit(a, io);
 
     // The test certificate is self-signed and for 127.0.0.1, so it is its own
@@ -504,8 +504,8 @@ test "interop: our client completes a post-quantum handshake with openssl s_serv
     // but `s_server -brief` writes nothing at all to a redirected stream --
     // measured, not assumed -- so there is nothing to read. The session stats
     // it does print are kept for diagnosis and are not the assertion.
-    const resp_const = try client.get(url, .{});
-    var resp = resp_const;
+    const respConst = try client.get(url, .{});
+    var resp = respConst;
     defer resp.deinit();
 
     const out = try srv.output(a, io);
@@ -520,7 +520,7 @@ test "interop: our client completes a post-quantum handshake with openssl s_serv
 /// Kept as a real file rather than a string literal so it stays readable and
 /// can be run by hand against a listening server, which is how the QUIC
 /// interop work was debugged in the first place.
-const aioquic_client = @embedFile("protocols/quic/testdata/aioquic_client.py");
+const aioquicClient = @embedFile("protocols/quic/testdata/aioquic_client.py");
 
 /// Whether a usable aioquic is importable.
 ///
@@ -557,18 +557,18 @@ test "interop: aioquic completes an HTTP/3 request against us" {
     var h = try Harness.startHttp3(a, io);
     defer h.stop(a);
 
-    const script_path = ".httpx-interop-aioquic.py";
+    const scriptPath = ".httpx-interop-aioquic.py";
     {
-        var f = try std.Io.Dir.cwd().createFile(io, script_path, .{});
+        var f = try std.Io.Dir.cwd().createFile(io, scriptPath, .{});
         defer f.close(io);
-        try f.writeStreamingAll(io, aioquic_client);
+        try f.writeStreamingAll(io, aioquicClient);
     }
-    defer std.Io.Dir.cwd().deleteFile(io, script_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, scriptPath) catch {};
 
-    const port_str = try std.fmt.allocPrint(a, "{d}", .{h.port});
-    defer a.free(port_str);
+    const portStr = try std.fmt.allocPrint(a, "{d}", .{h.port});
+    defer a.free(portStr);
 
-    const out = try runClient(a, io, &.{ "python3", script_path, port_str }, null);
+    const out = try runClient(a, io, &.{ "python3", scriptPath, portStr }, null);
     defer a.free(out);
     if (std.mem.indexOf(u8, out, "RESULT ok") == null) {
         std.debug.print("\n---AIOQUIC-OUTPUT---\n{s}\n---END---\n", .{out});

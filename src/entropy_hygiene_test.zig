@@ -60,20 +60,20 @@ fn containsPrng(io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !bool {
 /// Strips `test` declaration blocks so fixtures may pin a seed.
 fn stripTestBlocks(src: []const u8, out: *std.ArrayList(u8)) !void {
     const gpa = std.testing.allocator;
-    var in_test = false;
+    var inTest = false;
     var depth: usize = 0;
     var it = std.mem.splitScalar(u8, src, '\n');
 
     while (it.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (!in_test and std.mem.startsWith(u8, trimmed, "test ")) {
-            in_test = true;
+        if (!inTest and std.mem.startsWith(u8, trimmed, "test ")) {
+            inTest = true;
             depth = 0;
         }
-        if (in_test) {
+        if (inTest) {
             depth += std.mem.count(u8, line, "{");
             depth -|= std.mem.count(u8, line, "}");
-            if (depth == 0) in_test = false;
+            if (depth == 0) inTest = false;
         } else {
             try out.appendSlice(gpa, line);
             try out.append(gpa, '\n');

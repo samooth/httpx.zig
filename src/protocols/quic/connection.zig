@@ -1093,17 +1093,17 @@ pub const Connection = struct {
     /// the connection has nothing else to send.
     fn sendVersionNegotiation(self: *Connection, dgram: []const u8) void {
         if (dgram.len < 6) return;
-        const dcid_len = dgram[5];
-        const scid_off = 6 + dcid_len;
-        if (scid_off >= dgram.len) return;
-        const scid_len = dgram[scid_off];
-        const scid_start = scid_off + 1;
-        if (scid_start + scid_len > dgram.len) return;
+        const dcidLen = dgram[5];
+        const scidOff = 6 + dcidLen;
+        if (scidOff >= dgram.len) return;
+        const scidLen = dgram[scidOff];
+        const scidStart = scidOff + 1;
+        if (scidStart + scidLen > dgram.len) return;
         var buf: [128]u8 = undefined;
         const n = packetMod.writeVersionNegotiation(
             &buf,
-            dgram[scid_start..][0..scid_len],
-            dgram[6..][0..dcid_len],
+            dgram[scidStart..][0..scidLen],
+            dgram[6..][0..dcidLen],
         ) catch return;
         self.outbuf.appendSlice(self.allocator, buf[0..n]) catch return;
     }
@@ -1123,11 +1123,11 @@ pub const Connection = struct {
     /// receive buffer, ignoring the MTU we are still trying to raise
     /// (otherwise a probe could never target more than we already believe).
     fn maxSendDatagramCeiling(self: *const Connection) usize {
-        const peer_max: usize = if (self.peerParams) |p|
+        const peerMax: usize = if (self.peerParams) |p|
             @min(@as(usize, @intCast(p.maxUdpPayloadSize)), MAX_DATAGRAM)
         else
             MAX_DATAGRAM;
-        return peer_max;
+        return peerMax;
     }
 
     /// Accepts a PATH_RESPONSE against the outstanding probe. Split out so
@@ -1443,16 +1443,16 @@ pub const Connection = struct {
         // The key phase bit arrives header-protected, so only the correct
         // phase's HP key unmasks it into a meaningful value. Read it here,
         // after unmasking; before that it is noise.
-        const peer_phase = (work[0] & 0x04) != 0;
+        const peerPhase = (work[0] & 0x04) != 0;
 
         var pt: [MAX_DATAGRAM]u8 = undefined;
 
-        if (peer_phase != sp.rxKeyPhase) {
+        if (peerPhase != sp.rxKeyPhase) {
             // The peer updated ahead of us. Try its phase; if those keys do
             // not open the packet then it was our own phase, late.
-            const prev_keys = sp.keysRx;
-            const prev_secret = sp.rxSecret;
-            const prev_phase = sp.rxKeyPhase;
+            const prevKeys = sp.keysRx;
+            const prevSecret = sp.rxSecret;
+            const prevPhase = sp.rxKeyPhase;
             _ = self.advanceRxKeyPhase();
             const trial = sp.keysRx.?;
             var opened = false;
@@ -1464,9 +1464,9 @@ pub const Connection = struct {
                 // Not an update. Restore, then accept under the old keys:
                 // reordered packets from the previous phase must still
                 // decrypt, which is why they are not simply discarded.
-                sp.keysRx = prev_keys;
-                sp.rxSecret = prev_secret;
-                sp.rxKeyPhase = prev_phase;
+                sp.keysRx = prevKeys;
+                sp.rxSecret = prevSecret;
+                sp.rxKeyPhase = prevPhase;
                 protect.openWithKeys(pt[0..ctLen], work[aadLen..][0..ctLen], work[aadLen + ctLen ..][0..16].*, work[0..aadLen], keys, pn) catch
                     return Error.AuthenticationFailed;
             }
@@ -3124,12 +3124,12 @@ test "key update rotates 1-RTT keys and the peer follows the phase" {
     // Rotating advances the secret with "quic ku", changes the derived keys,
     // and flips the phase bit that goes on the wire.
     const before = cli.spaces[2].txSecret.?;
-    const before_key = cli.spaces[2].keysTx.?.key;
+    const beforeKey = cli.spaces[2].keysTx.?.key;
     try cli.initiateKeyUpdate();
     const after = cli.spaces[2].txSecret.?;
     try std.testing.expect(!std.mem.eql(u8, &before, &after));
     try std.testing.expectEqualSlices(u8, &crypto.nextApplicationSecret(before), after[0..]);
-    try std.testing.expect(!std.mem.eql(u8, before_key[0..16], cli.spaces[2].keysTx.?.key[0..16]));
+    try std.testing.expect(!std.mem.eql(u8, beforeKey[0..16], cli.spaces[2].keysTx.?.key[0..16]));
     try std.testing.expect(cli.spaces[2].txKeyPhase);
 
     // The receiver, still in phase 0, advances to meet it.
@@ -3222,18 +3222,18 @@ test "an unknown version is answered with version negotiation" {
     try std.testing.expectEqualSlices(u8, &scid, out[6..14]);
 
     // And the versions are ones the client can actually use.
-    var saw_v1 = false;
-    var saw_v2 = false;
+    var sawV1 = false;
+    var sawV2 = false;
     var pos: usize = 6 + scid.len;
     const dlen = out[pos];
     pos += 1 + dlen;
     while (pos + 4 <= out.len) : (pos += 4) {
         const v = std.mem.readInt(u32, out[pos..][0..4], .big);
-        if (v == @intFromEnum(packetMod.Version.version1)) saw_v1 = true;
-        if (v == @intFromEnum(packetMod.Version.version2)) saw_v2 = true;
+        if (v == @intFromEnum(packetMod.Version.version1)) sawV1 = true;
+        if (v == @intFromEnum(packetMod.Version.version2)) sawV2 = true;
     }
-    try std.testing.expect(saw_v1);
-    try std.testing.expect(saw_v2);
+    try std.testing.expect(sawV1);
+    try std.testing.expect(sawV2);
 }
 
 test "sends are capped by the peer's advertised max_udp_payload_size" {
@@ -3507,7 +3507,7 @@ test "1-RTT keys rotate on their own once the confidentiality limit is reached" 
     try cli.installKeys(.application, @splat(0xA1), @splat(0xB2));
 
     const sp = &cli.spaces[@intFromEnum(SpaceKind.application)];
-    var first_secret = sp.txSecret.?;
+    var firstSecret = sp.txSecret.?;
     try std.testing.expect(!sp.txKeyPhase);
 
     var payload: std.ArrayList(u8) = .empty;
@@ -3519,12 +3519,12 @@ test "1-RTT keys rotate on their own once the confidentiality limit is reached" 
     try cli.packetize(.application, &payload, 100);
     try std.testing.expectEqual(@as(u64, KEY_UPDATE_LIMIT - 1), sp.packetsInPhase);
     try std.testing.expect(!sp.txKeyPhase);
-    try std.testing.expectEqualSlices(u8, &first_secret, &sp.txSecret.?);
+    try std.testing.expectEqualSlices(u8, &firstSecret, &sp.txSecret.?);
 
     // Reaching it rotates by itself, with no application involvement. The
     // count resets, so the budget starts again under the new keys.
     try cli.packetize(.application, &payload, 200);
     try std.testing.expect(sp.txKeyPhase);
-    try std.testing.expect(!std.mem.eql(u8, &first_secret, &sp.txSecret.?));
+    try std.testing.expect(!std.mem.eql(u8, &firstSecret, &sp.txSecret.?));
     try std.testing.expectEqual(@as(u64, 0), sp.packetsInPhase);
 }

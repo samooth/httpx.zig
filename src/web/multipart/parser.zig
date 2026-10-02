@@ -400,12 +400,12 @@ pub fn parseMultipart(allocator: Allocator, body: []const u8, boundary: []const 
 
         const name = dispositionField(rawHeaders, "name") orelse return ParseError.Malformed;
         const filename = dispositionField(rawHeaders, "filename");
-        const filenameStar_val = dispositionField(rawHeaders, "filename*");
+        const filenameStarVal = dispositionField(rawHeaders, "filename*");
         const ctype = headerValue(rawHeaders, "Content-Type");
         const ctenc = headerValue(rawHeaders, "Content-Transfer-Encoding");
 
         var fs: ?FilenameStar = null;
-        if (filenameStar_val) |fsv| {
+        if (filenameStarVal) |fsv| {
             fs = parseFilenameStar(fsv);
         }
 

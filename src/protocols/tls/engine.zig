@@ -14,8 +14,8 @@ const x25519 = std.crypto.dh.X25519;
 /// ML-KEM from the stdlib, used directly for RFC 10024 X25519MLKEM768.
 /// Deliberately not `std.crypto.kem.hybrid.MlKem768X25519`: that is X-Wing,
 /// which OpenSSL 3.5+ and browsers do not speak over TLS.
-const ml_kem = std.crypto.kem.ml_kem;
-const MlKem = ml_kem.MLKem768;
+const mlKem = std.crypto.kem.ml_kem;
+const MlKem = mlKem.MLKem768;
 
 // RFC 10024 (X25519MLKEM768) wire sizes. The client share is the ML-KEM
 // encapsulation key followed by the X25519 share; the server share is the
@@ -406,14 +406,14 @@ pub const Engine = struct {
     /// (stack-local in `acceptBuffered`), so this state is private to the
     /// handshake and safe to store here.
     fn serverHybrid(self: *Engine, peer_key: []const u8) ![HY_SS_LEN]u8 {
-        const pk_m: *const [MLKEM_PK_LEN]u8 =
+        const pkM: *const [MLKEM_PK_LEN]u8 =
             @ptrCast(@alignCast(peer_key[0..MLKEM_PK_LEN].ptr));
-        const m_pk = MlKem.PublicKey.fromBytes(pk_m) catch
+        const mPk = MlKem.PublicKey.fromBytes(pkM) catch
             return error.InvalidKeyShare;
-        const es = m_pk.encaps(self.io);
-        var peer_x: [32]u8 = undefined;
-        @memcpy(&peer_x, peer_key[MLKEM_PK_LEN..]);
-        const ss_x = x25519.scalarmult(self.localKeypair.secret_key, peer_x) catch
+        const es = mPk.encaps(self.io);
+        var peerX: [32]u8 = undefined;
+        @memcpy(&peerX, peer_key[MLKEM_PK_LEN..]);
+        const ssX = x25519.scalarmult(self.localKeypair.secret_key, peerX) catch
             return error.InvalidKeyShare;
         // Server share: `mlkem_ct ‖ x25519_pk` (1088 + 32 = 1120).
         var ct: [HY_CT_LEN]u8 = undefined;
@@ -423,7 +423,7 @@ pub const Engine = struct {
         // RFC 10024 4.3: concatenate, do not hash.
         var out: [HY_SS_LEN]u8 = undefined;
         @memcpy(out[0..MLKEM_SS_LEN], &es.shared_secret);
-        @memcpy(out[MLKEM_SS_LEN..], &ss_x);
+        @memcpy(out[MLKEM_SS_LEN..], &ssX);
         return out;
     }
 
@@ -438,14 +438,14 @@ pub const Engine = struct {
             if (ks.keyExchange.len != HY_CT_LEN) return error.InvalidKeyShare;
             const mlkp = self.hybridMlKem orelse return error.InvalidKeyShare;
             const ct: *const [MLKEM_CT_LEN]u8 = @ptrCast(ks.keyExchange.ptr);
-            const ss_m = try mlkp.secret_key.decaps(ct);
-            var srv_x: [32]u8 = undefined;
-            @memcpy(&srv_x, ks.keyExchange[MLKEM_CT_LEN..]);
-            const ss_x = x25519.scalarmult(self.localKeypair.secret_key, srv_x) catch
+            const ssM = try mlkp.secret_key.decaps(ct);
+            var srvX: [32]u8 = undefined;
+            @memcpy(&srvX, ks.keyExchange[MLKEM_CT_LEN..]);
+            const ssX = x25519.scalarmult(self.localKeypair.secret_key, srvX) catch
                 return error.InvalidKeyShare;
             var out: [HY_SS_LEN]u8 = undefined;
-            @memcpy(out[0..MLKEM_SS_LEN], &ss_m);
-            @memcpy(out[MLKEM_SS_LEN..], &ss_x);
+            @memcpy(out[0..MLKEM_SS_LEN], &ssM);
+            @memcpy(out[MLKEM_SS_LEN..], &ssX);
             return SharedSecret.of(&out);
         }
         if (ks.group != .x25519) return error.UnsupportedCipherSuite;
@@ -2594,10 +2594,10 @@ test "hybrid decapsulation matches the peer's encapsulated secret" {
     const es = mlkp.public_key.encapsDeterministic(&seed);
     try std.testing.expectEqual(@as(usize, MLKEM_CT_LEN), es.ciphertext.len);
 
-    const srv_x = try x25519.KeyPair.generateDeterministic([_]u8{0x3C} ** 32);
+    const srvX = try x25519.KeyPair.generateDeterministic([_]u8{0x3C} ** 32);
     var share: [HY_CT_LEN]u8 = undefined;
     @memcpy(share[0..MLKEM_CT_LEN], &es.ciphertext);
-    @memcpy(share[MLKEM_CT_LEN..], &srv_x.public_key);
+    @memcpy(share[MLKEM_CT_LEN..], &srvX.public_key);
 
     const entry: handshakeMod.ServerHello.KeyShareEntry = .{
         .group = .x25519_ml_kem768,
@@ -2606,10 +2606,10 @@ test "hybrid decapsulation matches the peer's encapsulated secret" {
     const got = try client.deriveSharedSecret(entry);
 
     // RFC 10024 4.3: the secret is the concatenation, ML-KEM first.
-    const ss_x = try x25519.scalarmult(client.localKeypair.secret_key, srv_x.public_key);
+    const ssX = try x25519.scalarmult(client.localKeypair.secret_key, srvX.public_key);
     var want: [HY_SS_LEN]u8 = undefined;
     @memcpy(want[0..MLKEM_SS_LEN], &es.shared_secret);
-    @memcpy(want[MLKEM_SS_LEN..], &ss_x);
+    @memcpy(want[MLKEM_SS_LEN..], &ssX);
     try std.testing.expectEqual(@as(usize, HY_SS_LEN), got.len);
     try std.testing.expectEqualSlices(u8, &want, got.slice());
 }
